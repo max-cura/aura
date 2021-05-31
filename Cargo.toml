@@ -1,0 +1,25 @@
+cargo-features = ["edition2021"]
+
+[package]
+name = "aura"
+version = "0.1.0"
+edition = "2021"
+
+[profile.dev]
+split-debuginfo = "unpacked"
+debug = 1
+incremental = true
+lto = "thin"
+opt-level = 3
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+mach = "0.3"
+page_size = "0.4"
+libc = "0.2"
+parking_lot = "0.11"
+rand = "0.8"
+rand_xoshiro = "0.6"
+nix = "0.20"
+
+[dependencies]
+
