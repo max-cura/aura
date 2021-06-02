@@ -60,7 +60,7 @@ const MESH_TAG_MESHING: u8 = 1;
 /// Invariant(block in maybe-mesh-list => flags'maybe-mesh)
 /// Invariant(alloc_count == 0 => state in { empty }
 ///     |> alloc_count != 0 => state not in { empty })
-pub struct BlockHeader<'a> {
+pub struct BlockHeader {
     alloc_list: BiFreeList<u8>,
     free_list: BiFreeList<u8>,
     count: usize,
@@ -70,11 +70,11 @@ pub struct BlockHeader<'a> {
 
     padding1: [u64; 4],
     pub_free_list: AtomicPushFreeList<u8>,
-    bucket: Option<&'a UnsafeCell<Bucket<'a>>>,
+    bucket: *mut Bucket,
     tid: Option<ThreadId>,
     // Bucket::maybe_free_list
     //free_mutex: RawMutex,
-    maybe_next_free: *mut BlockHeader<'a>,
+    maybe_next_free: *mut BlockHeader,
 
     padding2: [u64; 3],
     flags: AtomicU64,
@@ -84,13 +84,17 @@ pub struct BlockHeader<'a> {
     mesh: AtomicTaggedPtr,
     mesh_mutex: RawMutex,
     padding2_0: [u8; 7],
-    maybe_next_mesh: *mut BlockHeader<'a>,
+    maybe_next_mesh: *mut BlockHeader,
 
     mesh_mask: MeshMask<128>,
     // at: 12 lines total
 }
 
-impl<'a> BlockHeader<'a> {
+unsafe impl Send for BlockHeader {}
+/// Required for certain global registries.
+unsafe impl Sync for BlockHeader {}
+
+impl BlockHeader {
     pub fn alloc(&mut self) -> *mut u8 {
         // Operation ordering:
         //  update alloc_count before allocating
@@ -110,7 +114,9 @@ impl<'a> BlockHeader<'a> {
         self.alloc_count.fetch_add(1, Ordering::SeqCst);
         // update mesh mask
         let addr = self.alloc_list.pop();
-        let offset = unsafe { addr.offset_from(self.slow_interior) as usize } / self.object_size;
+        let raw_offset = unsafe { addr.offset_from(self.slow_interior) };
+        //println!("raw_offset = {}", raw_offset);
+        let offset = raw_offset as usize / self.object_size;
         self.mesh_mask.set(offset);
         // return allocated object
         addr
@@ -121,7 +127,8 @@ impl<'a> BlockHeader<'a> {
             obj >= self.base()
                 && obj
                     < unsafe {
-                        self.base().offset((1usize << self.get_segment().block_shift()) as isize)
+                        // self.base().offset((1usize << self.get_segment().block_shift()) as isize)
+                        self.base().offset(4 * KB as isize)
                     }
         );
         let is_pub = match self.tid {
@@ -134,7 +141,7 @@ impl<'a> BlockHeader<'a> {
         } else {
             self.free_list.push(obj);
         }
-        if prev_cnt == 1 {
+        if prev_cnt == 1 && !self.bucket.is_null() {
             let mut flags_cache = self.flags.load(Ordering::SeqCst);
             if BLOCK_FLAGS_MAYBE_FREE != (flags_cache & BLOCK_FLAGS_MAYBE_FREE) {
                 loop {
@@ -148,25 +155,27 @@ impl<'a> BlockHeader<'a> {
                         Err(actual) => flags_cache = actual,
                     }
                 }
-                self.bucket.unwrap();
+                unsafe { &mut *self.bucket }.maybe_free(self as *mut BlockHeader);
             }
         }
         // handle meshing...
         else {
         }
     }
+
+    pub fn allocated(&self) -> usize { self.alloc_count.load(Ordering::SeqCst) }
 }
 
-impl<'a> BlockHeader<'a> {
-    pub fn _set_maybe_next_free(&mut self, new_ptr: *mut BlockHeader<'a>) {
+impl BlockHeader {
+    pub fn _set_maybe_next_free(&mut self, new_ptr: *mut BlockHeader) {
         self.maybe_next_free = new_ptr;
     }
-    pub fn _set_maybe_next_mesh(&mut self, new_ptr: *mut BlockHeader<'a>) {
+    pub fn _set_maybe_next_mesh(&mut self, new_ptr: *mut BlockHeader) {
         self.maybe_next_mesh = new_ptr;
     }
 
-    pub fn _maybe_next_free(&self) -> *mut BlockHeader<'a> { self.maybe_next_free }
-    pub fn _maybe_next_mesh(&self) -> *mut BlockHeader<'a> { self.maybe_next_mesh }
+    pub fn _maybe_next_free(&self) -> *mut BlockHeader { self.maybe_next_free }
+    pub fn _maybe_next_mesh(&self) -> *mut BlockHeader { self.maybe_next_mesh }
 }
 
 thread_local! (
@@ -177,12 +186,8 @@ thread_local! (
     }))
 );
 
-impl<'a> BlockHeader<'a> {
-    pub fn transfer<'b>(self, new_bucket: &'b UnsafeCell<Bucket<'b>>) -> BlockHeader<'b> {
-        unsafe { mem::transmute::<BlockHeader<'a>, BlockHeader<'b>>(self) }
-    }
-
-    pub fn from_raw_parts<'b>(body: *mut u8) -> BlockHeader<'a> {
+impl BlockHeader {
+    pub fn from_raw_parts(body: *mut u8) -> BlockHeader {
         BlockHeader {
             alloc_list: BiFreeList::new(),
             free_list: BiFreeList::new(),
@@ -192,7 +197,7 @@ impl<'a> BlockHeader<'a> {
             padding0: Default::default(),
             padding1: Default::default(),
             pub_free_list: AtomicPushFreeList::new(),
-            bucket: None,
+            bucket: ptr::null_mut(),
             tid: None,
             maybe_next_free: ptr::null_mut(),
             padding2: Default::default(),
@@ -210,12 +215,17 @@ impl<'a> BlockHeader<'a> {
     /// freelist setup.
     pub fn format(&mut self, osize: usize) -> *mut u8 {
         // THREAD_RNG.with(|rng| (*rng.borrow_mut()).next_u64());
-        let block_size = 1usize << self.get_segment().block_shift();
+        //let block_size = 1usize << self.get_segment().block_shift();
+        let block_size = 4 * KB;
         self.count = block_size / osize;
         self.object_size = osize;
 
         let mut order: Vec<usize> = (0..self.count).collect();
         THREAD_RNG.with(|rng| order.shuffle(&mut *rng.borrow_mut()));
+        println!(
+            "Shuffled fmt vec: {}",
+            order.iter().map(|n| format!("{}", n)).collect::<Vec<_>>().join(", ")
+        );
         let interior = self.slow_interior;
         let mut curr: *mut *mut u8 =
             unsafe { interior.offset((order[0] * osize) as isize) } as *mut *mut u8;
@@ -240,4 +250,97 @@ impl<'a> BlockHeader<'a> {
     }
 
     pub fn base(&self) -> *mut u8 { self.slow_interior }
+}
+
+impl BlockHeader {
+    pub fn _count(&self) -> usize { self.count }
+    pub fn _object_size(&self) -> usize { self.object_size }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::thread;
+
+    use rand::prelude::*;
+
+    use super::BlockHeader;
+    use crate::constants::KB;
+    use crate::vm::{VMRegion, VirtualRegion};
+
+    enum EncounterCategorization {
+        NotEncountered,
+        Encountered,
+        MultiplyEncountered,
+    }
+
+    #[test]
+    fn stress_test_sequential() {
+        let vm_region = match VMRegion::new(64 * KB, 64 * KB) {
+            Ok(r) => r,
+            Err(e) => panic!("VMRegino allocation failed: {}", e),
+        };
+        let mut block_header = BlockHeader::from_raw_parts(vm_region.base());
+        block_header.format(512);
+
+        let mut objects = Vec::<*mut u8>::new();
+        let iterations = 1_000_000usize;
+        let mut num_allocated = 0usize;
+        let mut num_freed = 0usize;
+        let mut failed_allocations = 0usize;
+
+        for _ in 0..iterations {
+            match thread_rng().gen::<u32>() % 2 {
+                0 => {
+                    let obj = block_header.alloc();
+                    if !obj.is_null() {
+                        objects.push(obj);
+
+                        num_allocated += 1;
+                    } else {
+                        failed_allocations += 1;
+                    }
+                },
+                1 => {
+                    if objects.len() > 0 {
+                        let index = thread_rng().gen_range(0..objects.len());
+                        let selection = objects.remove(index);
+
+                        block_header.free(selection);
+
+                        num_freed += 1;
+                    }
+                },
+                _ => unreachable!(),
+            }
+
+            assert!(objects.iter().all(|item| {
+                match objects.iter().fold(
+                    EncounterCategorization::NotEncountered,
+                    |accum, item2| {
+                        if item == item2 {
+                            match accum {
+                                EncounterCategorization::NotEncountered => {
+                                    EncounterCategorization::Encountered
+                                },
+                                EncounterCategorization::Encountered => {
+                                    EncounterCategorization::MultiplyEncountered
+                                },
+                                EncounterCategorization::MultiplyEncountered => {
+                                    EncounterCategorization::MultiplyEncountered
+                                },
+                            }
+                        } else {
+                            accum
+                        }
+                    },
+                ) {
+                    EncounterCategorization::Encountered => true,
+                    _ => false,
+                }
+            }));
+        }
+
+        assert!(num_allocated >= num_freed);
+        assert!(num_allocated - num_freed <= block_header._count());
+    }
 }

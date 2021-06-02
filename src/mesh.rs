@@ -1,6 +1,5 @@
 use std::intrinsics;
 use std::iter::Iterator;
-use std::marker::PhantomData;
 use std::mem::{self, MaybeUninit};
 use std::sync::atomic::*;
 
@@ -43,12 +42,11 @@ impl<const N: usize> MeshMask<N> {
 pub struct MeshIter<'a, const N: usize> {
     mesh: &'a mut MeshMask<N>,
     curr: usize,
-    _marker: PhantomData<[char; N]>,
 }
 
 impl<'a, const N: usize> MeshIter<'a, N> {
     pub fn from_mesh<'b>(m: &'b mut MeshMask<N>) -> MeshIter<'b, N> {
-        MeshIter { mesh: m, curr: 0, _marker: PhantomData }
+        MeshIter { mesh: m, curr: 0 }
     }
 }
 

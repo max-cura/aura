@@ -3,6 +3,7 @@ cargo-features = ["edition2021"]
 [package]
 name = "aura"
 version = "0.1.0"
+authors = ["Maximilien M. Cura"]
 edition = "2021"
 
 [profile.dev]
@@ -20,6 +21,8 @@ parking_lot = "0.11"
 rand = "0.8"
 rand_xoshiro = "0.6"
 nix = "0.20"
+num_cpus = "1.0"
+crossbeam-channel = "0.5"
 
 [dependencies]
 

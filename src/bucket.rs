@@ -8,18 +8,19 @@ use parking_lot::RawMutex;
 use super::block::BlockHeader;
 use super::free_list::{AtomicPushFreeList, FreeListPush};
 use crate::constants::KB;
+use crate::util::extrinsic_bsr;
 
 #[repr(C)]
-pub struct Bucket<'a> {
+pub struct Bucket {
     // size is implicit
-    active: AtomicPtr<BlockHeader<'a>>,
-    maybe_free_list: AtomicPtr<BlockHeader<'a>>,
-    maybe_mesh_list: AtomicPtr<BlockHeader<'a>>,
+    active: AtomicPtr<BlockHeader>,
+    maybe_free_list: AtomicPtr<BlockHeader>,
+    maybe_mesh_list: AtomicPtr<BlockHeader>,
     count: AtomicUsize,
 }
 
 // Primary path
-impl<'a> Bucket<'a> {
+impl Bucket {
     pub fn alloc(&mut self) -> *mut u8 {
         let maybe_active = self.active.load(Ordering::SeqCst);
         if maybe_active.is_null() {
@@ -34,15 +35,15 @@ impl<'a> Bucket<'a> {
         maybe_object
     }
 
-    fn source_block(&mut self) -> *mut BlockHeader<'a> {}
+    fn source_block(&mut self) -> *mut BlockHeader { ptr::null_mut() }
 }
 
 // Infrastructure
-impl<'a> Bucket<'a> {
-    pub fn new() -> Bucket<'a> { Bucket::default() }
+impl Bucket {
+    pub fn new() -> Bucket { Bucket::default() }
 
     /// Invariant(never bucket'maybe_free [@ block block])
-    pub fn maybe_free(&mut self, block_header: *mut BlockHeader<'a>) {
+    pub fn maybe_free(&mut self, block_header: *mut BlockHeader) {
         let mut curr = self.maybe_free_list.load(Ordering::SeqCst);
 
         loop {
@@ -61,7 +62,7 @@ impl<'a> Bucket<'a> {
 }
 
 // Other traits
-impl<'a> Default for Bucket<'a> {
+impl Default for Bucket {
     fn default() -> Self {
         Bucket {
             active: AtomicPtr::new(ptr::null_mut()),
@@ -72,49 +73,44 @@ impl<'a> Default for Bucket<'a> {
     }
 }
 
-pub fn bucket_select_tiny(size: usize) -> usize {
-    debug_assert!(size < TINY_OBJECT_BOUNDARY && size > 0);
-    let size = if size >= 8 { size - 8 } else { size };
-    size / TINY_BUCKET_STEP
-}
+pub const fn bucket_select_tiny(size: usize) -> usize { 0 }
 
-pub fn bucket_select_small(size: usize) -> usize {
-    debug_assert!(size >= TINY_OBJECT_BOUNDARY && size < SMALL_OBJECT_BOUNDARY);
-    let ind = extrinsic_bsr(size) - GRAIN_LOG;
-    let gran = size >> ind;
-    let log_off = ind - extrinsic_bsr(TINY_OBJECT_BOUNDARY);
-    GRAIN * log_off + gran
-}
+pub const fn bucket_select_small(size: usize) -> usize { 0 }
 
-pub fn bucket_select_large(size: usize) -> usize {
-    debug_assert!(size >= SMALL_OBJECT_BOUNDARY && size < LARGE_OBJECT_BOUNDARY);
-    let ind = extrinsic_bsr(size) - GRAIN_LOG;
-    let gran = size >> ind;
-    let log_off = ind - extrinsic_bsr(SMALL_OBJECT_BOUNDARY);
-    GRAIN * log_off + gran
-}
+pub const fn bucket_select_large(size: usize) -> usize { 0 }
 
-const GRAIN: usize = 8;
-const GRAIN_MASK: usize = 7;
-const GRAIN_LOG: usize = extrinsic_bsr(GRAIN_MASK);
+pub const fn bucket_to_size(bucket: usize) -> usize { 0 }
 
-macro_rules! extrinsic_bsr_variant {
-    ($func_name: ident, $typ: ty) => {
-        const fn $func_name(x: $typ) -> usize {
-            8usize * mem::size_of::<$typ>() - intrinsics::ctlz(x) as usize
-        }
+pub const fn semi_logarithmic_interval(lower: usize, upper: usize) -> usize { 0 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        bucket_select_large, bucket_select_small, bucket_select_tiny, bucket_to_size,
+        semi_logarithmic_interval, LARGE_BUCKETS, LARGE_OBJECT_BOUNDARY, NONTINY_SMALL_BUCKETS,
+        SMALL_BUCKETS, SMALL_OBJECT_BOUNDARY, TINY_OBJECT_BOUNDARY, TINY_SMALL_BUCKETS,
     };
-}
-
-extrinsic_bsr_variant!(extrinsic_bsr, usize);
-extrinsic_bsr_variant!(extrinsic_bsr64, u64);
-extrinsic_bsr_variant!(extrinsic_bsr32, u32);
-extrinsic_bsr_variant!(extrinsic_bsr16, u16);
-extrinsic_bsr_variant!(extrinsic_bsr8, u8);
-
-const fn semi_logarithmic_interval(lower: usize, upper: usize) -> usize {
-    let interval = extrinsic_bsr(upper / lower);
-    GRAIN * (interval - GRAIN_LOG + 1)
+    #[test]
+    fn bucket_tiny() {
+        for size in 1..=16 {
+            assert_eq!(bucket_select_tiny(size), 1);
+        }
+        assert_eq!(bucket_to_size(0), 16);
+        for bucket in 1..TINY_SMALL_BUCKETS {
+            for i_size in 1..=8 {
+                assert_eq!(bucket_select_tiny(16 + (bucket - 1) * 8 + 8), bucket);
+            }
+            assert_eq!(bucket_to_size(bucket), 16 + (bucket - 1) * 8 + 8);
+        }
+    }
+    #[test]
+    fn bucket_small() {
+        unimplemented!();
+    }
+    #[test]
+    fn bucket_large() {
+        unimplemented!();
+    }
 }
 
 pub const TINY_OBJECT_BOUNDARY: usize = 512;
