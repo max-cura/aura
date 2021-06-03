@@ -54,12 +54,12 @@ const MESH_TAG_NORMAL: u8 = 0;
 const MESH_TAG_MESHING: u8 = 1;
 
 #[repr(C)]
-// 'a is the lifetime of the bucket
 /// Invariant(flags'maybe-free => state in { currently active | empty })
 /// Invariant(block in maybe-free-list => flags'maybe-free)
 /// Invariant(block in maybe-mesh-list => flags'maybe-mesh)
 /// Invariant(alloc_count == 0 => state in { empty }
 ///     |> alloc_count != 0 => state not in { empty })
+/// Invariant(flags->not is_active => load alloc_count >= .alloc_count.)
 pub struct BlockHeader {
     alloc_list: BiFreeList<u8>,
     free_list: BiFreeList<u8>,
@@ -164,6 +164,12 @@ impl BlockHeader {
     }
 
     pub fn allocated(&self) -> usize { self.alloc_count.load(Ordering::SeqCst) }
+
+    pub fn prepare_acquire(&mut self, tid: ThreadId, bucket: &UnsafeCell<Bucket>) {
+        // Known:       block is active & correctly sized
+        // Unknown:     mesh state, free-ness
+        self.flags.fetch_and(!BLOCK_FLAGS_MAYBE_FREE, Ordering::SeqCst);
+    }
 }
 
 impl BlockHeader {

@@ -18,6 +18,18 @@ pub enum SegmentType {
     Huge,
 }
 
+impl SegmentType {
+    pub fn from_bucket(bucket: usize) -> SegmentType {
+        if bucket < SMALL_BUCKETS {
+            SegmentType::Small
+        } else if bucket < SMALL_BUCKETS + LARGE_BUCKETS {
+            SegmentType::Large
+        } else {
+            SegmentType::Huge
+        }
+    }
+}
+
 #[repr(C)]
 pub struct SegmentHeader {
     // line 0
@@ -42,12 +54,12 @@ pub fn registry() -> Arc<Mutex<Vec<&'static SegmentHeader>>> {
 }
 
 impl SegmentHeader {
-    pub fn new(kind: SegmentType) {
+    pub fn new(kind: SegmentType) -> Option<Vec<&'static BlockHeader>> {
         debug_assert!(match kind {
             SegmentType::Small | SegmentType::Large => true,
             _ => false,
         });
-        let vm_region = VMRegion::new(4 * MB, 4 * MB).unwrap();
+        let vm_region = VMRegion::new(4 * MB, 4 * MB).ok()?;
         unsafe {
             ptr::write(vm_region.base() as *mut SegmentHeader, SegmentHeader {
                 block_shift: match kind {
@@ -85,6 +97,12 @@ impl SegmentHeader {
         // update registry
         let registry = registry();
         registry.lock().push(header);
+
+        Some({
+            (0..num_block_headers)
+                .map(|idx| unsafe { &*header.block_header(idx).get() })
+                .collect::<Vec<_>>()
+        })
     }
 
     pub fn block_shift(&self) -> usize { self.block_shift }

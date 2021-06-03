@@ -7,6 +7,7 @@ use parking_lot::Mutex;
 
 use super::block::BlockHeader;
 use super::bucket::*;
+use super::segment::{SegmentHeader, SegmentType};
 
 #[repr(C)]
 pub struct TopLevel {
@@ -22,8 +23,8 @@ impl TopLevel {
     pub fn new() -> TopLevel {
         TopLevel {
             small_empties: Mutex::new(Vec::new()),
-            small_buckets:
-                <[Mutex<Vec<&'static BlockHeader>>; SMALL_BUCKETS] as Default>::default(),
+            small_buckets: <[Mutex<Vec<&'static BlockHeader>>; SMALL_BUCKETS] as Default>::default(
+            ),
             large_empties: Mutex::new(Vec::new()),
             large_buckets: {
                 let mut data: [MaybeUninit<Mutex<Vec<&'static BlockHeader>>>; LARGE_BUCKETS] =
@@ -56,7 +57,7 @@ impl TopLevel {
     }
 
     pub fn receive(&self, index: usize, header: &'static BlockHeader) {
-        let mut guard = if header.allocated() == 0 { 
+        let mut guard = if header.allocated() == 0 {
             self.which_empty(index).lock()
         } else {
             self.indexed(index).lock()
@@ -64,17 +65,32 @@ impl TopLevel {
         guard.push(header);
     }
 
-    pub fn request(&self, index: usize) -> &'static BlockHeader) {
-        let maybe_empties = unsafe { self.which_empty_unchecked(index) };
+    pub fn request(&self, index: usize) -> Option<&'static BlockHeader> {
+        let maybe_empties = unsafe { self.which_empty_unchecked(index).lock() };
         if !maybe_empties.is_empty() {
-            return maybe_empties.pop()
+            let b = maybe_empties.pop();
+            drop(maybe_empties);
+            // unchecked because it doesn't need to be checked
+            unsafe { b.as_ref().unwrap_unchecked() }.format(bucket_to_size(index));
+            return b
         }
-        let maybe_non_empties = unsafe { self.indexed_unchecked(index) };
+        let maybe_non_empties = unsafe { self.indexed_unchecked(index).lock() };
         if !maybe_non_empties.is_empty() {
             return maybe_non_empties.pop()
+        } else {
+            drop(maybe_non_empties);
         }
 
+        let mut first = None;
         /* toplevel allocation */
+        for block_header in SegmentHeader::new(SegmentType::from_bucket(index))?.into_iter() {
+            match first {
+                None => first = Some(block_header),
+                _ => maybe_empties.push(block_header),
+            };
+        }
+        unsafe { first.as_ref().unwrap_unchecked() }.format(bucket_to_size(index));
+        first
     }
 }
 
@@ -86,7 +102,10 @@ impl TopLevel {
             &self.large_buckets.get_unchecked(index - SMALL_BUCKETS)
         }
     }
-    pub unsafe fn which_empty_unchecked(&self, index: usize) -> &'_ Mutex<Vec<&'static BlockHeader>> {
+    pub unsafe fn which_empty_unchecked(
+        &self,
+        index: usize,
+    ) -> &'_ Mutex<Vec<&'static BlockHeader>> {
         if index < SMALL_BUCKETS {
             &self.small_empties
         } else {
