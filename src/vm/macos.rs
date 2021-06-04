@@ -24,10 +24,7 @@ fn mach_error_to_string(err: kern_return_t) -> String {
     }
     match unsafe { CStr::from_ptr(strp) }.to_str() {
         Ok(s) => s.to_string(),
-        Err(_) => panic!(
-            "couldn't get valid UTF-8 error string for Mach error code {:#?}",
-            err
-        ),
+        Err(_) => panic!("couldn't get valid UTF-8 error string for Mach error code {:#?}", err),
     }
 }
 
@@ -44,11 +41,7 @@ impl MachVMRegion {
         } else {
             vm_statistics::VM_FLAGS_FIXED | vm_statistics::VM_FLAGS_OVERWRITE
         };
-        let mask = if target.is_none() && align != 0 {
-            align - 1
-        } else {
-            0
-        };
+        let mask = if target.is_none() && align != 0 { align - 1 } else { 0 };
         let kr = vm::mach_vm_map(
             traps::mach_task_self(),
             &mut addr as *mut vm_types::mach_vm_address_t,
@@ -89,11 +82,7 @@ impl MachVMRegion {
         align: usize,
     ) -> Result<(*mut u8, vm_prot::vm_prot_t, vm_prot::vm_prot_t), Error> {
         debug_assert!(!begin.is_null());
-        debug_assert!(if target.is_some() {
-            !target.as_ref().unwrap().is_null()
-        } else {
-            true
-        });
+        debug_assert!(if target.is_some() { !target.as_ref().unwrap().is_null() } else { true });
         debug_assert_ne!(size, 0);
         let mask = if target.is_none() && align != 0 {
             debug_assert!(align.is_power_of_two());
@@ -150,50 +139,26 @@ impl VirtualRegion for MachVMRegion {
 
     fn map_to(&self, offset: usize, size: usize, target: *mut u8) -> Result<Self, Error> {
         let (addr, _, _) = unsafe {
-            Self::_remap(
-                self.begin.offset(offset as isize),
-                size,
-                false,
-                Some(target),
-                0,
-            )?
+            Self::_remap(self.begin.offset(offset as isize), size, false, Some(target), 0)?
         };
         Ok(unsafe { MachVMRegion::from_raw_parts(addr, size) })
     }
     fn map_aligned(&self, offset: usize, size: usize, target_align: usize) -> Result<Self, Error> {
         let (addr, _, _) = unsafe {
-            Self::_remap(
-                self.begin.offset(offset as isize),
-                size,
-                false,
-                None,
-                target_align,
-            )?
+            Self::_remap(self.begin.offset(offset as isize), size, false, None, target_align)?
         };
         Ok(unsafe { MachVMRegion::from_raw_parts(addr, size) })
     }
 
     fn dup_to(&self, offset: usize, size: usize, target: *mut u8) -> Result<Self, Error> {
         let (addr, _, _) = unsafe {
-            Self::_remap(
-                self.begin.offset(offset as isize),
-                size,
-                true,
-                Some(target),
-                0,
-            )?
+            Self::_remap(self.begin.offset(offset as isize), size, true, Some(target), 0)?
         };
         Ok(unsafe { MachVMRegion::from_raw_parts(addr, size) })
     }
     fn dup_aligned(&self, offset: usize, size: usize, target_align: usize) -> Result<Self, Error> {
         let (addr, _, _) = unsafe {
-            Self::_remap(
-                self.begin.offset(offset as isize),
-                size,
-                true,
-                None,
-                target_align,
-            )?
+            Self::_remap(self.begin.offset(offset as isize), size, true, None, target_align)?
         };
         Ok(unsafe { MachVMRegion::from_raw_parts(addr, size) })
     }
@@ -201,10 +166,7 @@ impl VirtualRegion for MachVMRegion {
     fn detach(&mut self) -> Result<(), Error> {
         let (addr, _) = unsafe { Self::_allocate(self.size, Some(self.begin), 0)? };
         if addr != self.begin {
-            panic!(
-                "detach failed: separated address {:#?} (should be {:#?})",
-                addr, self.begin
-            );
+            panic!("detach failed: separated address {:#?} (should be {:#?})", addr, self.begin);
         }
         Ok(())
     }
@@ -241,12 +203,15 @@ mod test {
     use super::super::VirtualRegion;
     use super::MachVMRegion;
 
+    const TEST_SIZE: usize = 4 * crate::constants::MB;
+
     #[test]
     fn test_alloc_free() {
-        let r = MachVMRegion::new(0x4000usize, 0x4000usize).unwrap();
+        let r = MachVMRegion::new(TEST_SIZE, TEST_SIZE).unwrap();
         unsafe {
-            *r.base() = 1;
-            *r.base().offset(0x3fffisize) = 1;
+            for i in 0..(TEST_SIZE / 0x1000) {
+                *r.base().offset(i as isize * 0x1000) = 1;
+            }
         }
         r.free().unwrap();
     }

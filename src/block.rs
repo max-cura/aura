@@ -15,6 +15,7 @@ use super::bucket::Bucket;
 use super::free_list::{AnyFreeList, AtomicPushFreeList, BiFreeList, FreeListPop, FreeListPush};
 use super::mesh::MeshMask;
 use super::segment::SegmentHeader;
+use super::top_level;
 use crate::constants::{GB, KB, MB};
 
 pub struct AtomicTaggedPtr(AtomicUsize);
@@ -66,7 +67,8 @@ pub struct BlockHeader {
     count: usize,
     object_size: usize,
     slow_interior: *mut u8,
-    padding0: [u64; 3],
+    segment_idx: usize,
+    padding0: [u64; 2],
 
     padding1: [u64; 4],
     pub_free_list: AtomicPushFreeList<u8>,
@@ -86,8 +88,7 @@ pub struct BlockHeader {
     padding2_0: [u8; 7],
     maybe_next_mesh: *mut BlockHeader,
 
-    mesh_mask: MeshMask<128>,
-    // at: 12 lines total
+    mesh_mask: MeshMask<64>,
 }
 
 unsafe impl Send for BlockHeader {}
@@ -127,8 +128,8 @@ impl BlockHeader {
             obj >= self.base()
                 && obj
                     < unsafe {
-                        // self.base().offset((1usize << self.get_segment().block_shift()) as isize)
-                        self.base().offset(4 * KB as isize)
+                        self.base().offset((1usize << self.get_segment().block_shift()) as isize)
+                        // self.base().offset(4 * KB as isize)
                     }
         );
         let is_pub = match self.tid {
@@ -141,7 +142,7 @@ impl BlockHeader {
         } else {
             self.free_list.push(obj);
         }
-        if prev_cnt == 1 && !self.bucket.is_null() {
+        if prev_cnt == 1 {
             let mut flags_cache = self.flags.load(Ordering::SeqCst);
             if BLOCK_FLAGS_MAYBE_FREE != (flags_cache & BLOCK_FLAGS_MAYBE_FREE) {
                 loop {
@@ -155,21 +156,18 @@ impl BlockHeader {
                         Err(actual) => flags_cache = actual,
                     }
                 }
-                unsafe { &mut *self.bucket }.maybe_free(self as *mut BlockHeader);
+                if !self.bucket.is_null() {
+                    unsafe { &mut *self.bucket }.maybe_free(self as *mut BlockHeader);
+                } else {
+                    let top_level = top_level::get();
+                    top_level.free(self);
+                }
             }
         }
-        // handle meshing...
-        else {
-        }
+        // TODO: Meshing
     }
 
     pub fn allocated(&self) -> usize { self.alloc_count.load(Ordering::SeqCst) }
-
-    pub fn prepare_acquire(&mut self, tid: ThreadId, bucket: &UnsafeCell<Bucket>) {
-        // Known:       block is active & correctly sized
-        // Unknown:     mesh state, free-ness
-        self.flags.fetch_and(!BLOCK_FLAGS_MAYBE_FREE, Ordering::SeqCst);
-    }
 }
 
 impl BlockHeader {
@@ -193,13 +191,14 @@ thread_local! (
 );
 
 impl BlockHeader {
-    pub fn from_raw_parts(body: *mut u8) -> BlockHeader {
+    pub fn from_raw_parts(body: *mut u8, segment_idx: usize) -> BlockHeader {
         BlockHeader {
             alloc_list: BiFreeList::new(),
             free_list: BiFreeList::new(),
             count: 0,
             object_size: 0,
             slow_interior: body,
+            segment_idx: segment_idx,
             padding0: Default::default(),
             padding1: Default::default(),
             pub_free_list: AtomicPushFreeList::new(),
@@ -221,10 +220,18 @@ impl BlockHeader {
     /// freelist setup.
     pub fn format(&mut self, osize: usize) -> *mut u8 {
         // THREAD_RNG.with(|rng| (*rng.borrow_mut()).next_u64());
-        //let block_size = 1usize << self.get_segment().block_shift();
-        let block_size = 4 * KB;
+        let block_size = 1usize << self.get_segment().block_shift();
+        // let block_size = 4 * KB;
         self.count = block_size / osize;
         self.object_size = osize;
+        println!(
+            "block size: {}, segment={:#?}..{:#?}, object_size={}, count={}",
+            block_size,
+            self.get_segment() as *const SegmentHeader,
+            unsafe { mem::transmute::<_, *const u8>(self.get_segment()).offset(4 * MB as isize) },
+            osize,
+            self.count
+        );
 
         let mut order: Vec<usize> = (0..self.count).collect();
         THREAD_RNG.with(|rng| order.shuffle(&mut *rng.borrow_mut()));
@@ -232,18 +239,44 @@ impl BlockHeader {
             "Shuffled fmt vec: {}",
             order.iter().map(|n| format!("{}", n)).collect::<Vec<_>>().join(", ")
         );
-        let interior = self.slow_interior;
+        let interior: *mut u8 = self.slow_interior;
+        println!("Begins at {:#?}, ends at {:#?}", interior, unsafe {
+            interior.offset(block_size as isize)
+        });
         let mut curr: *mut *mut u8 =
             unsafe { interior.offset((order[0] * osize) as isize) } as *mut *mut u8;
+        // let mut next: *mut *mut u8 = unsafe {
+        // mem::MaybeUninit::uninit().assume_init() };
         let mut next: *mut *mut u8;
 
+        println!("Prepping lists...");
         self.alloc_list.swap(curr as *mut u8);
         self.free_list.swap(ptr::null_mut());
         self.pub_free_list.swap(ptr::null_mut());
 
+        println!("Installing lists...");
         for i in 0..self.count - 1 {
-            next = unsafe { interior.offset((order[i + 1] * osize) as isize) } as *mut *mut u8;
+            use std::io::Write;
+
+            println!(
+                "interior={:#?}, offset={} ({})",
+                interior,
+                order[i + 1],
+                order[i + 1] * osize
+            );
+            let tmp1 = unsafe { interior.offset((order[i + 1] * osize) as isize) };
+            let tmp2 = tmp1 as *mut *mut u8;
+            next = tmp2;
+            println!(
+                "#{}, curr=#{} ({:#?}), next=#{} ({:#?})... ",
+                i,
+                order[i],
+                curr,
+                order[i + 1],
+                next
+            );
             unsafe { *curr = next as *mut u8 };
+            println!("written!");
             curr = next;
         }
 
@@ -261,17 +294,20 @@ impl BlockHeader {
 impl BlockHeader {
     pub fn _count(&self) -> usize { self.count }
     pub fn _object_size(&self) -> usize { self.object_size }
+    pub fn _segment_idx(&self) -> usize { self.segment_idx }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::thread;
+    use std::{mem, thread};
 
     use rand::prelude::*;
 
     use super::BlockHeader;
     use crate::constants::KB;
+    use crate::segment::{SegmentHeader, SegmentType};
     use crate::vm::{VMRegion, VirtualRegion};
+    use crate::{segment, top_level};
 
     enum EncounterCategorization {
         NotEncountered,
@@ -281,11 +317,19 @@ mod tests {
 
     #[test]
     fn stress_test_sequential() {
-        let vm_region = match VMRegion::new(64 * KB, 64 * KB) {
-            Ok(r) => r,
-            Err(e) => panic!("VMRegino allocation failed: {}", e),
+        top_level::init_top_level();
+        segment::init_registry();
+        // let vm_region = match VMRegion::new(64 * KB, 64 * KB) {
+        //     Ok(r) => r,
+        //     Err(e) => panic!("VMRegion allocation failed: {}", e),
+        // };
+        // let mut block_header = BlockHeader::from_raw_parts(vm_region.base(), 0);
+        let mut seg_blocks = SegmentHeader::new(SegmentType::Small).unwrap();
+        let block_header = unsafe {
+            mem::transmute::<*mut BlockHeader, &mut BlockHeader>(
+                seg_blocks.pop().unwrap_unchecked().get(),
+            )
         };
-        let mut block_header = BlockHeader::from_raw_parts(vm_region.base());
         block_header.format(512);
 
         let mut objects = Vec::<*mut u8>::new();
