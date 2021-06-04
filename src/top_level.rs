@@ -2,7 +2,7 @@ use std::cell::UnsafeCell;
 use std::default::Default;
 use std::mem::{self, MaybeUninit};
 use std::ptr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -15,11 +15,13 @@ use super::segment::{SegmentHeader, SegmentType};
 pub struct TopLevel {
     empties: Mutex<Vec<&'static UnsafeCell<BlockHeader>>>,
     buckets: [Mutex<Vec<&'static UnsafeCell<BlockHeader>>>; BUCKETS],
+    total_count: AtomicUsize,
 }
 
 /// For use with TopLevel::count
 pub enum TopLevelBlockType {
     Empty,
+    Total,
     Bucket(usize),
 }
 
@@ -38,6 +40,7 @@ impl TopLevel {
                 }
                 unsafe { mem::transmute::<_, _>(data) }
             },
+            total_count: AtomicUsize::new(0),
         }
     }
 
@@ -45,6 +48,7 @@ impl TopLevel {
     pub fn count(&self, block_type: TopLevelBlockType) -> usize {
         let which = match block_type {
             TopLevelBlockType::Empty => self.empties.lock(),
+            TopLevelBlockType::Total => return self.total_count.load(Ordering::Relaxed),
             TopLevelBlockType::Bucket(bucket) => self.indexed(bucket).lock(),
         };
         which.len()
@@ -123,6 +127,7 @@ impl TopLevel {
                 None => first = Some(block_header),
                 _ => maybe_empties.push(block_header),
             };
+            self.total_count.fetch_add(1, Ordering::Relaxed);
         }
         drop(maybe_empties);
 

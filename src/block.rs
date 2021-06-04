@@ -18,6 +18,7 @@ use super::segment::SegmentHeader;
 use super::top_level;
 use crate::constants::{GB, KB, MB};
 
+#[derive(Debug)]
 pub struct AtomicTaggedPtr(AtomicUsize);
 
 pub const PTR_TAG_MASK: usize = 0x7usize;
@@ -94,6 +95,33 @@ pub struct BlockHeader {
 
     mesh_mask: MeshMask<64>,
 }
+impl std::fmt::Debug for BlockHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let selfp = self as *const BlockHeader;
+        f.debug_struct("BlockHeader")
+            .field("self", &selfp)
+            .field("alloc_list", &self.alloc_list)
+            .field("free_list", &self.free_list)
+            .field("count", &self.count)
+            .field("object_size", &self.object_size)
+            .field("slow_interior", &self.slow_interior)
+            .field("segment_idx", &self.segment_idx)
+            .field("next_in_bucket", &self.next_in_bucket)
+            .field("pub_free_list", &self.pub_free_list)
+            .field(
+                "bucket",
+                if self.bucket.is_null() { &self.bucket } else { unsafe { &*self.bucket } },
+            )
+            .field("tid", &self.tid)
+            .field("maybe_next_free", &self.maybe_next_free)
+            .field("flags", &self.flags)
+            .field("alloc_count", &self.alloc_count)
+            .field("mesh", &self.mesh)
+            .field("maybe_next_mesh", &self.maybe_next_mesh)
+            // .field("mesh_mask", &self.mesh_mask)
+            .finish()
+    }
+}
 
 unsafe impl Send for BlockHeader {}
 /// Required for certain global registries.
@@ -117,7 +145,15 @@ impl BlockHeader {
                 return ptr::null_mut()
             }
         }
-        self.alloc_count.fetch_add(1, Ordering::SeqCst);
+        let prev_cnt = self.alloc_count.fetch_add(1, Ordering::SeqCst);
+        // println!(
+        //     "{}T prev_cnt={}, now={} on {:#?}",
+        //     thread::current().id().as_u64(),
+        //     prev_cnt,
+        //     self.alloc_count.load(Ordering::SeqCst),
+        //     self as *const BlockHeader
+        // );
+        // println!("alloc on {:#?}", self as *const BlockHeader);
         // update mesh mask
         // println!("getting addr...");
         let addr = self.alloc_list.pop();
@@ -143,7 +179,17 @@ impl BlockHeader {
             None => true,
             Some(block_tid) => block_tid.as_u64() != thread::current().id().as_u64(),
         };
+        let prev_cnt2 = self.alloc_count.load(Ordering::SeqCst);
         let prev_cnt = self.alloc_count.fetch_sub(1, Ordering::SeqCst);
+        // println!(
+        //     "{}T prev_cnt={} (<- {}), now={} as {:#?}",
+        //     thread::current().id().as_u64(),
+        //     prev_cnt,
+        //     prev_cnt2,
+        //     self.alloc_count.load(Ordering::SeqCst),
+        //     self as *const BlockHeader
+        // );
+
         if is_pub {
             // println!("pub free");
             self.pub_free_list.push(obj);
@@ -152,9 +198,26 @@ impl BlockHeader {
             self.free_list.push(obj);
         }
         if prev_cnt == 1 {
+            // println!(
+            //     "{}T prev_cnt: {} ({:#?})",
+            //     thread::current().id().as_u64(),
+            //     prev_cnt,
+            //     self as *const BlockHeader
+            // );
             let mut flags_cache = self.flags.load(Ordering::SeqCst);
             if BLOCK_FLAGS_MAYBE_FREE != (flags_cache & BLOCK_FLAGS_MAYBE_FREE) {
+                // if !(self.alloc_count.load(Ordering::SeqCst) == 0
+                //     || BLOCK_FLAGS_IS_ACTIVE == flags_cache & BLOCK_FLAGS_IS_ACTIVE)
+                // {
+                //     println!("{:#?}", self);
+                //     panic!("assertion violation (that one ,_,)");
+                // }
+                let mut wrote = true;
                 loop {
+                    if BLOCK_FLAGS_MAYBE_FREE == (flags_cache & BLOCK_FLAGS_MAYBE_FREE) {
+                        wrote = false;
+                        break
+                    }
                     while BLOCK_FLAGS_FREE_LOCK == flags_cache & BLOCK_FLAGS_FREE_LOCK {
                         flags_cache = self.flags.load(Ordering::SeqCst);
                         thread::yield_now();
@@ -169,11 +232,13 @@ impl BlockHeader {
                         Err(actual) => flags_cache = actual,
                     }
                 }
-                if !self.bucket.is_null() {
-                    unsafe { &mut *self.bucket }.maybe_free(self as *mut BlockHeader);
-                } else {
-                    let top_level = top_level::get();
-                    top_level.free(self);
+                if wrote {
+                    if !self.bucket.is_null() {
+                        unsafe { &mut *self.bucket }.maybe_free(self as *mut BlockHeader);
+                    } else {
+                        let top_level = top_level::get();
+                        top_level.free(self);
+                    }
                 }
             }
         }
@@ -188,17 +253,20 @@ impl BlockHeader {
         // need to update: tid, bucket (for now)
         self.tid = Some(thread::current().id());
         self.bucket = bucket_ptr;
+        self.flags.fetch_or(BLOCK_FLAGS_IS_ACTIVE, Ordering::SeqCst);
     }
 
     pub fn prep_free(&mut self) {
         // NOT in freelist
         self.tid = None;
         self.bucket = ptr::null_mut();
+        self.flags.fetch_and(!BLOCK_FLAGS_IS_ACTIVE, Ordering::SeqCst);
     }
 
     pub fn prep_inactive(&mut self) {
         // self.tid = None;
         // no need to set bucket
+        self.flags.fetch_and(!BLOCK_FLAGS_IS_ACTIVE, Ordering::SeqCst);
     }
 }
 

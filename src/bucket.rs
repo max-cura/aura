@@ -20,6 +20,49 @@ pub struct Bucket {
     count: AtomicUsize,
 }
 
+impl std::fmt::Debug for Bucket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut curr = self.active.load(Ordering::SeqCst);
+        let mut active_list = Vec::new();
+        let mut i = 0usize;
+        while !curr.is_null() {
+            active_list.push(curr);
+            curr = unsafe { &*curr }.next_in_bucket;
+            i += 1;
+            if i > 2000 {
+                println!("warn: forced break at {}", i);
+                break
+            }
+        }
+        curr = self.maybe_free_list.load(Ordering::SeqCst);
+        let mut free_list = Vec::new();
+        i = 0;
+        while !curr.is_null() {
+            free_list.push(curr);
+            curr = unsafe { &*curr }._maybe_next_free();
+            i += 1;
+            if i > 100 {
+                println!("warn: forced break at {}", i);
+                break
+            }
+        }
+        f.write_fmt(format_args_nl!(
+            "bucket list: {}",
+            active_list.into_iter().map(|o| format!("{:#?}", o)).collect::<Vec<_>>().join(" -> "),
+        ))?;
+        f.write_fmt(format_args_nl!(
+            "free list: {}",
+            free_list.into_iter().map(|o| format!("{:#?}", o)).collect::<Vec<_>>().join(" -> "),
+        ))?;
+        f.debug_struct("Bucket")
+            .field("active", &self.active)
+            .field("maybe_free_list", &self.maybe_free_list)
+            .field("maybe_mesh_list", &self.maybe_mesh_list)
+            .field("count", &self.count)
+            .finish()
+    }
+}
+
 // Primary path
 impl Bucket {
     pub fn alloc(&mut self, bucket_idx: usize) -> *mut u8 {
@@ -57,16 +100,10 @@ impl Bucket {
         let top_level = top_level::get();
         while !free_list.is_null() {
             let free_list_ref = unsafe { &mut *free_list };
-            // Once it's in OUR free list, that means that it belongs to this
-            // thread, and it was empty at some point
-            // in order to become non-free, it must be allocated from
-            // in order to be allocated from, it must become active
-            // in order to become active, this function must have been run
-            // therefore it is empty. QED.
-            assert!(
-                0 == free_list_ref.allocated() || free_list == self.active.load(Ordering::SeqCst)
-            );
-            let is_free = free_list != self.active.load(Ordering::SeqCst);
+            // experience has shown that, in fact, it will occur that there are
+            // duds in the free list
+            let is_free =
+                free_list != self.active.load(Ordering::SeqCst) && free_list_ref.allocated() == 0;
 
             if is_free {
                 free_list_ref.flags.fetch_xor(
@@ -74,7 +111,22 @@ impl Bucket {
                     Ordering::SeqCst,
                 );
 
-                free_list = free_list_ref._maybe_next_free();
+                let next_free = free_list_ref._maybe_next_free();
+                let mut curr = self.active.load(Ordering::SeqCst);
+                let mut removed = false;
+                while !curr.is_null() {
+                    let b_ref = unsafe { &mut *curr };
+                    if b_ref.next_in_bucket == free_list {
+                        b_ref.next_in_bucket = free_list_ref.next_in_bucket;
+                        removed = true;
+                        break
+                    }
+                    curr = b_ref.next_in_bucket;
+                }
+                if !removed {
+                    use std::io::Write;
+                    panic!("couldn't find block {:#?} in self {:#?}", free_list_ref, self);
+                }
 
                 match first {
                     None => {
@@ -95,6 +147,8 @@ impl Bucket {
                         );
                     },
                 };
+
+                free_list = next_free;
             } else {
                 free_list_ref.flags.fetch_and(!block::BLOCK_FLAGS_MAYBE_FREE, Ordering::SeqCst);
                 free_list = free_list_ref._maybe_next_free();

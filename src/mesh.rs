@@ -4,6 +4,7 @@ use std::mem::{self, MaybeUninit};
 use std::sync::atomic::*;
 
 #[repr(transparent)]
+#[derive(Debug)]
 pub struct MeshMask<const N: usize>([AtomicU64; N]);
 
 impl<const N: usize> MeshMask<N> {

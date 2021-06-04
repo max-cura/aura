@@ -16,6 +16,7 @@ pub trait FreeListPop<T>: AnyFreeList {
 }
 
 #[repr(C)]
+#[derive(Debug)]
 pub struct AtomicPushFreeList<T>(AtomicPtr<T>);
 
 impl<T> Default for AtomicPushFreeList<T> {
@@ -42,13 +43,15 @@ impl<T: std::fmt::Debug> FreeListPush<T> for AtomicPushFreeList<T> {
                 Err(actual) => curr = actual,
             }
         }
-        println!("pushed {:#?} over {:#?}", ptr, unsafe { *(ptr as *mut *mut T) });
+        // println!("pushed {:#?} over {:#?}", ptr, unsafe { *(ptr as *mut *mut
+        // T) });
     }
 
     fn swap(&mut self, new_ptr: *mut T) -> *mut T { self.0.swap(new_ptr, Ordering::SeqCst) }
 }
 
 #[repr(C)]
+#[derive(Debug)]
 pub struct BiFreeList<T>(*mut T);
 
 impl<T> Default for BiFreeList<T> {

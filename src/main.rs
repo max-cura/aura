@@ -6,6 +6,7 @@
 #![feature(thread_id_value)]
 #![feature(const_maybe_uninit_assume_init, inline_const, const_generics, const_evaluatable_checked)]
 #![feature(option_result_unwrap_unchecked)]
+#![feature(format_args_nl)]
 
 extern crate crossbeam_channel;
 extern crate libc;
@@ -72,25 +73,42 @@ enum EncounterCategorization {
 }
 
 fn main() {
+    print!("Performing initialization...");
     aura_init();
+    println!("done");
 
-    let mut allocs = Vec::new();
-    for _ in 0..36 {
-        let obj = aura_alloc(8 * KB - 1);
-        println!("Allocated object: {:#?}", obj);
-        unsafe { *obj = 3 };
-        allocs.push(obj);
-    }
+    print!("Testing many allocator threads, one deallocator thread...");
+
+    // many allocators, one free site
     let (tx, rx) = crossbeam_channel::unbounded::<Box<u8>>();
-    thread::spawn(move || {
-        for _ in 0..36 {
-            tx.send(unsafe { Box::from_raw(aura_alloc(16)) }).unwrap();
-        }
-    });
+    let mut handles = Vec::new();
+    for i in 0..4 {
+        let tx = tx.clone();
+        handles.push(thread::spawn(move || {
+            for _ in 0..9 {
+                let obj = aura_alloc(16);
+                tx.send(unsafe { Box::from_raw(obj) }).unwrap();
+            }
+        }));
+    }
+    drop(tx);
+    for handle in handles.into_iter() {
+        handle.join().unwrap();
+    }
     for alloc in rx.iter() {
         aura_free(Box::into_raw(alloc));
     }
-    println!("Done allocating first batch");
+    println!("ok");
+
+    print!("Testing one allocator thread, many deallocator threads...");
+
+    // one allocator, many free sites
+    let mut allocs = Vec::new();
+    for _ in 0..36 {
+        let obj = aura_alloc(8 * KB - 1);
+        unsafe { *obj = 3 };
+        allocs.push(obj);
+    }
     let mut handles = Vec::new();
     for _ in 0..36 {
         // need something send
@@ -102,169 +120,211 @@ fn main() {
     for handle in handles.into_iter() {
         handle.join().unwrap();
     }
-    println!("Done freeing");
-
-    for i in 0..36 {
+    for _ in 0..36 {
         let obj = aura_alloc(8 * KB - 1);
-        println!("Allocated object: {:#?}", obj);
         unsafe { *obj = 4 };
         allocs.push(obj);
     }
-    println!("Done allocating second batch");
+    for _ in 0..36 {
+        aura_free(allocs.pop().unwrap());
+    }
+    println!("ok");
 
-    println!("toplevel count: {}", top_level::get().count(top_level::TopLevelBlockType::Empty));
+    println!("Testing many allocator threads, many deallocator threads...");
+    // many allocator, many free site
+    let iterations_per_thread = 100000000usize;
+    let num_allocated = Arc::new(AtomicUsize::new(0));
+    let num_failed = Arc::new(AtomicUsize::new(0));
+    let num_freed = Arc::new(AtomicUsize::new(0));
 
-    // let mut seg_blocks = SegmentHeader::new(SegmentType::Small).unwrap();
-    // let block_header = unsafe {
-    //     mem::transmute::<*mut BlockHeader, &mut BlockHeader>(
-    //         seg_blocks.pop().unwrap_unchecked().get(),
-    //     )
-    // };
-    // block_header.format(512);
+    let num_threads = num_cpus::get();
+    let mut handles = Vec::new();
 
-    // let iterations = 200000usize;
-    // let num_allocated = Arc::new(AtomicUsize::new(0));
-    // let num_freed = Arc::new(AtomicUsize::new(0));
+    let orig_hook = panic::take_hook();
+    {
+        let num_allocated = Arc::clone(&num_allocated);
+        let num_freed = Arc::clone(&num_freed);
+        let num_failed = Arc::clone(&num_failed);
+        panic::set_hook(Box::new(move |panic_info| {
+            // invoke the default handler and exit the process
+            orig_hook(panic_info);
+            println!(
+                "failed: panicked (allocated {}, failed {} allocations,  freed {})",
+                num_allocated.load(Ordering::Relaxed),
+                num_failed.load(Ordering::Relaxed),
+                num_freed.load(Ordering::Relaxed),
+            );
+            process::exit(1);
+        }));
+    }
 
-    // let num_threads = num_cpus::get();
-    // // let num_threads = 1usize;
-    // let mut handles = Vec::new();
+    let mut receivers = Vec::new();
+    let mut senders = Vec::new();
+    for i in 0..num_threads {
+        let (tx, rx) = crossbeam_channel::unbounded::<Box<u8>>();
+        receivers.push(rx);
+        senders.push(tx);
+    }
 
-    // // let mut block_header_cell = RefCell::new(block_header);
+    for i in 0..num_threads {
+        let num_allocated = Arc::clone(&num_allocated);
+        let num_freed = Arc::clone(&num_freed);
+        let num_failed = Arc::clone(&num_failed);
+        let thread_rx = receivers.pop().unwrap();
+        let thread_tx_bank = senders.iter().map(|tx| tx.clone()).collect::<Vec<_>>();
+        // println!("Starting thread {}", i);
+        handles.push(thread::spawn(move || {
+            // debug: requires 4-core
+            // let color = match i {
+            //     0 => "\x1b[31m",
+            //     1 => "\x1b[32m",
+            //     2 => "\x1b[33m",
+            //     3 => "\x1b[34m",
+            //     _ => unreachable!(),
+            // };
+            let mut objects = Vec::<*mut u8>::new();
+            for _ in 0..iterations_per_thread {
+                match thread_rng().gen_range(0..4) {
+                    0 => {
+                        let obj = aura_alloc(thread_rng().gen_range(1..8 * KB));
+                        if !obj.is_null() {
+                            objects.push(obj);
 
-    // let orig_hook = panic::take_hook();
-    // panic::set_hook(Box::new(move |panic_info| {
-    //     // invoke the default handler and exit the process
-    //     orig_hook(panic_info);
-    //     process::exit(1);
-    // }));
+                            num_allocated.fetch_add(1, Ordering::SeqCst);
+                            // println!(
+                            //     "{}t{}a{:#?}\t({})\x1b[0m",
+                            //     color,
+                            //     thread::current().id().as_u64(),
+                            //     obj,
+                            //     objects.len()
+                            // );
+                        } else {
+                            num_failed.fetch_add(1, Ordering::SeqCst);
+                        }
+                    },
+                    1 => {
+                        if objects.len() > 0 {
+                            let index = thread_rng().gen_range(0..objects.len());
+                            let obj = objects.remove(index);
 
-    // for i in 0..num_threads {
-    //     // let borrow: RefMut<BlockHeader> = block_header_cell.borrow_mut();
-    //     let block_header: &'static mut BlockHeader =
-    //         unsafe { mem::transmute::<&mut BlockHeader, &'static mut
-    // BlockHeader>(block_header) };     // block_header_cell.undo_leak();
+                            // println!(
+                            //     "{}t{}f{:#?}\t({})\x1b[0m",
+                            //     color,
+                            //     thread::current().id().as_u64(),
+                            //     obj,
+                            //     objects.len()
+                            // );
+                            aura_free(obj);
 
-    //     let num_allocated = Arc::clone(&num_allocated);
-    //     let num_freed = Arc::clone(&num_freed);
-    //     handles.push(thread::spawn(move || {
-    //         // debug: requires 4-core
-    //         let color = match i {
-    //             0 => "\x1b[31m",
-    //             1 => "\x1b[32m",
-    //             2 => "\x1b[33m",
-    //             3 => "\x1b[34m",
-    //             _ => unreachable!(),
-    //         };
-    //         let mut objects = Vec::<*mut u8>::new();
-    //         for _ in 0..iterations {
-    //             match thread_rng().gen::<u32>() % 2 {
-    //                 0 => {
-    //                     let obj = block_header.alloc();
-    //                     if !obj.is_null() {
-    //                         objects.push(obj);
+                            num_freed.fetch_add(1, Ordering::SeqCst);
+                        }
+                    },
+                    2 => {
+                        if objects.len() > 0 {
+                            let index = thread_rng().gen_range(0..objects.len());
+                            let obj = objects.remove(index);
+                            loop {
+                                let recv_idx = thread_rng().gen_range(0..num_threads);
+                                // println!(
+                                //     "{}t{}s{:#?} -> {}\x1b[0m",
+                                //     color,
+                                //     thread::current().id().as_u64(),
+                                //     obj,
+                                //     recv_idx
+                                // );
+                                match thread_tx_bank[recv_idx].send(unsafe { Box::from_raw(obj) }) {
+                                    Ok(_) => break,
+                                    Err(_) => continue,
+                                }
+                            }
+                        }
+                    },
+                    3 => {
+                        thread_rx.try_iter().for_each(|obj| {
+                            num_freed.fetch_add(1, Ordering::SeqCst);
+                            let obj = Box::into_raw(obj);
+                            // println!(
+                            //     "{}t{}f pub {:#?}\x1b[0m",
+                            //     color,
+                            //     thread::current().id().as_u64(),
+                            //     obj
+                            // );
+                            aura_free(obj);
+                        });
+                    },
+                    _ => unreachable!(),
+                }
 
-    //                         num_allocated.fetch_add(1, Ordering::SeqCst);
-    //                         io::stderr()
-    //                             .lock()
-    //                             .write_fmt(format_args!(
-    //                                 "{}thread {} allocated
-    // {}\t({})\x1b[0m\n",                                 color,
-    //                                 thread::current().id().as_u64(),
-    //                                 unsafe {
-    // obj.offset_from(block_header.base()) } / 512,
-    // objects                                     .iter()
-    //                                     .map(|n| format!(
-    //                                         "{}",
-    //                                         unsafe {
-    // n.offset_from(block_header.base()) } / 512
-    // ))                                     .collect::<Vec<_>>()
-    //                                     .join(", ")
-    //                             ))
-    //                             .unwrap();
-    //                     }
-    //                 },
-    //                 1 => {
-    //                     if objects.len() > 0 {
-    //                         let index =
-    // thread_rng().gen_range(0..objects.len());                         let
-    // obj = objects.remove(index);
+                let dupes = objects.iter().all(|item| {
+                    match objects.iter().fold(
+                        EncounterCategorization::NotEncountered,
+                        |accum, item2| {
+                            if item == item2 {
+                                match accum {
+                                    EncounterCategorization::NotEncountered => {
+                                        EncounterCategorization::Encountered
+                                    },
+                                    EncounterCategorization::Encountered => {
+                                        EncounterCategorization::MultiplyEncountered
+                                    },
+                                    EncounterCategorization::MultiplyEncountered => {
+                                        EncounterCategorization::MultiplyEncountered
+                                    },
+                                }
+                            } else {
+                                accum
+                            }
+                        },
+                    ) {
+                        EncounterCategorization::Encountered => true,
+                        _ => false,
+                    }
+                });
+                if !dupes && !objects.is_empty() {
+                    panic!(
+                        "thread {}: found duplicate objects: {}",
+                        thread::current().id().as_u64(),
+                        objects.iter().map(|n| format!("{:#?}", n)).collect::<Vec<_>>().join(", ")
+                    );
+                }
+            }
+            for tx in thread_tx_bank.into_iter() {
+                drop(tx);
+            }
+            thread_rx
+                .iter()
+                .chain(objects.into_iter().map(|p| unsafe { Box::from_raw(p) }))
+                .for_each(|obj| {
+                    let obj = Box::into_raw(obj);
+                    // println!(
+                    //     "{}t{}f end {:#?}\x1b[0m",
+                    //     color,
+                    //     thread::current().id().as_u64(),
+                    //     obj
+                    // );
+                    num_freed.fetch_add(1, Ordering::SeqCst);
+                    aura_free(obj);
+                });
+        }));
+    }
+    for i in senders.into_iter() {
+        drop(i);
+    }
 
-    //                         block_header.free(obj);
-    //                         io::stderr()
-    //                             .lock()
-    //                             .write_fmt(format_args!(
-    //                                 "{}thread {} freed {}\t({})\x1b[0m\n",
-    //                                 color,
-    //                                 thread::current().id().as_u64(),
-    //                                 unsafe {
-    // obj.offset_from(block_header.base()) } / 512,
-    // objects                                     .iter()
-    //                                     .map(|n| format!(
-    //                                         "{}",
-    //                                         unsafe {
-    // n.offset_from(block_header.base()) } / 512
-    // ))                                     .collect::<Vec<_>>()
-    //                                     .join(", ")
-    //                             ))
-    //                             .unwrap();
+    for handle in handles {
+        handle.join().unwrap();
+    }
 
-    //                         num_freed.fetch_add(1, Ordering::SeqCst);
-    //                     }
-    //                 },
-    //                 _ => unreachable!(),
-    //             }
+    println!(
+        "ok (allocated {}, failed {} allocations,  freed {})",
+        num_allocated.load(Ordering::Relaxed),
+        num_failed.load(Ordering::Relaxed),
+        num_freed.load(Ordering::Relaxed),
+    );
 
-    //             let dupes = objects.iter().all(|item| {
-    //                 match objects.iter().fold(
-    //                     EncounterCategorization::NotEncountered,
-    //                     |accum, item2| {
-    //                         if item == item2 {
-    //                             match accum {
-    //                                 EncounterCategorization::NotEncountered
-    // => {
-    // EncounterCategorization::Encountered
-    // },
-    // EncounterCategorization::Encountered => {
-    // EncounterCategorization::MultiplyEncountered
-    // },
-    // EncounterCategorization::MultiplyEncountered => {
-    // EncounterCategorization::MultiplyEncountered
-    // },                             }
-    //                         } else {
-    //                             accum
-    //                         }
-    //                     },
-    //                 ) {
-    //                     EncounterCategorization::Encountered => true,
-    //                     _ => false,
-    //                 }
-    //             });
-    //             if !dupes && !objects.is_empty() {
-    //                 panic!(
-    //                     "thread {}: found duplicate objects: {}",
-    //                     thread::current().id().as_u64(),
-    //                     objects
-    //                         .iter()
-    //                         .map(|n| format!(
-    //                             "{}",
-    //                             unsafe { n.offset_from(block_header.base()) }
-    // / 512                         ))
-    //                         .collect::<Vec<_>>()
-    //                         .join(", ")
-    //                 );
-    //             }
-    //         }
-    //     }));
-    // }
-
-    // for handle in handles {
-    //     handle.join().unwrap();
-    // }
-
-    // println!(
-    //     "allocated {}, freed {}",
-    //     num_allocated.load(Ordering::Relaxed),
-    //     num_freed.load(Ordering::Relaxed),
-    // );
+    println!(
+        "toplevel count (empty): {}/{}",
+        top_level::get().count(top_level::TopLevelBlockType::Empty),
+        top_level::get().count(top_level::TopLevelBlockType::Total)
+    );
 }
