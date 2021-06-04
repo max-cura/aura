@@ -81,6 +81,15 @@ fn main() {
         unsafe { *obj = 3 };
         allocs.push(obj);
     }
+    let (tx, rx) = crossbeam_channel::unbounded::<Box<u8>>();
+    thread::spawn(move || {
+        for _ in 0..36 {
+            tx.send(unsafe { Box::from_raw(aura_alloc(16)) }).unwrap();
+        }
+    });
+    for alloc in rx.iter() {
+        aura_free(Box::into_raw(alloc));
+    }
     println!("Done allocating first batch");
     let mut handles = Vec::new();
     for _ in 0..36 {
