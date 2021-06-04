@@ -30,7 +30,7 @@ impl<T> AnyFreeList for AtomicPushFreeList<T> {
     fn is_empty(&self) -> bool { self.0.load(Ordering::SeqCst).is_null() }
 }
 
-impl<T> FreeListPush<T> for AtomicPushFreeList<T> {
+impl<T: std::fmt::Debug> FreeListPush<T> for AtomicPushFreeList<T> {
     fn push(&mut self, ptr: *mut T) {
         let mut curr = self.0.load(Ordering::SeqCst);
         loop {
@@ -42,6 +42,7 @@ impl<T> FreeListPush<T> for AtomicPushFreeList<T> {
                 Err(actual) => curr = actual,
             }
         }
+        println!("pushed {:#?} over {:#?}", ptr, unsafe { *(ptr as *mut *mut T) });
     }
 
     fn swap(&mut self, new_ptr: *mut T) -> *mut T { self.0.swap(new_ptr, Ordering::SeqCst) }

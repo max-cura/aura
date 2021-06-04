@@ -48,8 +48,10 @@ impl AtomicTaggedPtr {
 const BLOCK_FLAGS_NONE: u64 = 0u64;
 const BLOCK_FLAGS_IS_ACTIVE: u64 = 1u64;
 
-const BLOCK_FLAGS_MAYBE_FREE: u64 = 2u64;
+pub const BLOCK_FLAGS_MAYBE_FREE: u64 = 2u64;
 const BLOCK_FLAGS_MAYBE_MESH: u64 = 4u64;
+
+pub const BLOCK_FLAGS_FREE_LOCK: u64 = 8u64;
 
 const MESH_TAG_NORMAL: u8 = 0;
 const MESH_TAG_MESHING: u8 = 1;
@@ -68,18 +70,20 @@ pub struct BlockHeader {
     object_size: usize,
     slow_interior: *mut u8,
     segment_idx: usize,
-    padding0: [u64; 2],
+    pub next_in_bucket: *mut BlockHeader,
+    padding0: [u64; 1],
 
-    padding1: [u64; 4],
+    padding1: [u64; 3],
     pub_free_list: AtomicPushFreeList<u8>,
     bucket: *mut Bucket,
     tid: Option<ThreadId>,
     // Bucket::maybe_free_list
-    //free_mutex: RawMutex,
+    free_mutex: RawMutex,
+    padding1_0: [u8; 7],
     maybe_next_free: *mut BlockHeader,
 
     padding2: [u64; 3],
-    flags: AtomicU64,
+    pub flags: AtomicU64,
     alloc_count: AtomicUsize,
     // Invariant(state in { meshing } => mesh'tag'meshing
     //      |> mesh'tag'normal => state not in { meshing })
@@ -103,6 +107,7 @@ impl BlockHeader {
         //
         // Meshing can take place whenever
         if self.alloc_list.is_empty() {
+            // println!("empty");
             if !self.free_list.is_empty() {
                 self.alloc_list.swap(self.free_list.swap(ptr::null_mut()));
             } else if !self.pub_free_list.is_empty() {
@@ -114,7 +119,9 @@ impl BlockHeader {
         }
         self.alloc_count.fetch_add(1, Ordering::SeqCst);
         // update mesh mask
+        // println!("getting addr...");
         let addr = self.alloc_list.pop();
+        // println!("addr = {:#?}", addr);
         let raw_offset = unsafe { addr.offset_from(self.slow_interior) };
         //println!("raw_offset = {}", raw_offset);
         let offset = raw_offset as usize / self.object_size;
@@ -133,19 +140,25 @@ impl BlockHeader {
                     }
         );
         let is_pub = match self.tid {
-            None => false,
-            Some(block_tid) => block_tid == thread::current().id(),
+            None => true,
+            Some(block_tid) => block_tid.as_u64() != thread::current().id().as_u64(),
         };
         let prev_cnt = self.alloc_count.fetch_sub(1, Ordering::SeqCst);
         if is_pub {
+            // println!("pub free");
             self.pub_free_list.push(obj);
         } else {
+            // println!("local free");
             self.free_list.push(obj);
         }
         if prev_cnt == 1 {
             let mut flags_cache = self.flags.load(Ordering::SeqCst);
             if BLOCK_FLAGS_MAYBE_FREE != (flags_cache & BLOCK_FLAGS_MAYBE_FREE) {
                 loop {
+                    while BLOCK_FLAGS_FREE_LOCK == flags_cache & BLOCK_FLAGS_FREE_LOCK {
+                        flags_cache = self.flags.load(Ordering::SeqCst);
+                        thread::yield_now();
+                    }
                     match self.flags.compare_exchange_weak(
                         flags_cache,
                         flags_cache | BLOCK_FLAGS_MAYBE_FREE,
@@ -168,6 +181,25 @@ impl BlockHeader {
     }
 
     pub fn allocated(&self) -> usize { self.alloc_count.load(Ordering::SeqCst) }
+}
+
+impl BlockHeader {
+    pub fn prep_active(&mut self, bucket_ptr: *mut Bucket) {
+        // need to update: tid, bucket (for now)
+        self.tid = Some(thread::current().id());
+        self.bucket = bucket_ptr;
+    }
+
+    pub fn prep_free(&mut self) {
+        // NOT in freelist
+        self.tid = None;
+        self.bucket = ptr::null_mut();
+    }
+
+    pub fn prep_inactive(&mut self) {
+        // self.tid = None;
+        // no need to set bucket
+    }
 }
 
 impl BlockHeader {
@@ -199,11 +231,14 @@ impl BlockHeader {
             object_size: 0,
             slow_interior: body,
             segment_idx: segment_idx,
+            next_in_bucket: ptr::null_mut(),
             padding0: Default::default(),
             padding1: Default::default(),
             pub_free_list: AtomicPushFreeList::new(),
             bucket: ptr::null_mut(),
             tid: None,
+            free_mutex: <RawMutex as parking_lot::lock_api::RawMutex>::INIT,
+            padding1_0: Default::default(),
             maybe_next_free: ptr::null_mut(),
             padding2: Default::default(),
             flags: AtomicU64::new(0),
@@ -221,64 +256,47 @@ impl BlockHeader {
     pub fn format(&mut self, osize: usize) -> *mut u8 {
         // THREAD_RNG.with(|rng| (*rng.borrow_mut()).next_u64());
         let block_size = 1usize << self.get_segment().block_shift();
+        // println!("Block size: {}", block_size);
         // let block_size = 4 * KB;
         self.count = block_size / osize;
+        // println!("block_size={}, osize={}, count={}", block_size, osize, self.count);
         self.object_size = osize;
-        println!(
-            "block size: {}, segment={:#?}..{:#?}, object_size={}, count={}",
-            block_size,
-            self.get_segment() as *const SegmentHeader,
-            unsafe { mem::transmute::<_, *const u8>(self.get_segment()).offset(4 * MB as isize) },
-            osize,
-            self.count
-        );
 
         let mut order: Vec<usize> = (0..self.count).collect();
         THREAD_RNG.with(|rng| order.shuffle(&mut *rng.borrow_mut()));
-        println!(
-            "Shuffled fmt vec: {}",
-            order.iter().map(|n| format!("{}", n)).collect::<Vec<_>>().join(", ")
-        );
+        // println!(
+        //     "Shuffled fmt vec: {}",
+        //     order.iter().map(|n| format!("{}", n)).collect::<Vec<_>>().join(", ")
+        // );
         let interior: *mut u8 = self.slow_interior;
-        println!("Begins at {:#?}, ends at {:#?}", interior, unsafe {
-            interior.offset(block_size as isize)
-        });
         let mut curr: *mut *mut u8 =
             unsafe { interior.offset((order[0] * osize) as isize) } as *mut *mut u8;
         // let mut next: *mut *mut u8 = unsafe {
         // mem::MaybeUninit::uninit().assume_init() };
         let mut next: *mut *mut u8;
 
-        println!("Prepping lists...");
         self.alloc_list.swap(curr as *mut u8);
         self.free_list.swap(ptr::null_mut());
         self.pub_free_list.swap(ptr::null_mut());
 
-        println!("Installing lists...");
         for i in 0..self.count - 1 {
             use std::io::Write;
 
-            println!(
-                "interior={:#?}, offset={} ({})",
-                interior,
-                order[i + 1],
-                order[i + 1] * osize
-            );
             let tmp1 = unsafe { interior.offset((order[i + 1] * osize) as isize) };
             let tmp2 = tmp1 as *mut *mut u8;
             next = tmp2;
-            println!(
-                "#{}, curr=#{} ({:#?}), next=#{} ({:#?})... ",
-                i,
-                order[i],
-                curr,
-                order[i + 1],
-                next
-            );
+            // println!(
+            //     "#{}, curr=#{} ({:#?}), next=#{} ({:#?})... ",
+            //     i,
+            //     order[i],
+            //     curr,
+            //     order[i + 1],
+            //     next
+            // );
             unsafe { *curr = next as *mut u8 };
-            println!("written!");
             curr = next;
         }
+        unsafe { *curr = ptr::null_mut() };
 
         ptr::null_mut()
     }

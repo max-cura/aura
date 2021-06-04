@@ -5,7 +5,7 @@ use std::{intrinsics, mem, ptr};
 
 use parking_lot::RawMutex;
 
-use super::block::BlockHeader;
+use super::block::{self, BlockHeader};
 use super::free_list::{AtomicPushFreeList, FreeListPush};
 use super::{bucket, top_level};
 use crate::constants::KB;
@@ -22,21 +22,34 @@ pub struct Bucket {
 
 // Primary path
 impl Bucket {
-    pub fn alloc(&mut self) -> *mut u8 {
+    pub fn alloc(&mut self, bucket_idx: usize) -> *mut u8 {
         let maybe_active = self.active.load(Ordering::SeqCst);
         if maybe_active.is_null() {
-            // TODO generic path
+            // println!("Null case");
+            let bhp = self.source_block(bucket_idx);
+            let bh = unsafe { &mut *bhp };
+            bh.next_in_bucket = ptr::null_mut();
+            self.active.swap(bhp, Ordering::SeqCst);
+            return bh.alloc()
         }
+        // println!("General case");
         let maybe_active = unsafe { &mut *maybe_active };
+        // println!("from block: ");
         let maybe_object = maybe_active.alloc();
+        // println!("got {:#?}", maybe_object);
         if !maybe_object.is_null() {
             return maybe_object
         }
-        // TODO generic path
-        maybe_object
+        // println!("Pull case");
+        let bhp = self.source_block(bucket_idx);
+        let bh = unsafe { &mut *bhp };
+        bh.next_in_bucket = self.active.load(Ordering::SeqCst);
+        unsafe { &mut *bh.next_in_bucket }.prep_inactive();
+        self.active.swap(bhp, Ordering::SeqCst);
+        bh.alloc()
     }
 
-    fn source_block(&mut self) -> *mut BlockHeader {
+    fn source_block(&mut self, bucket_idx: usize) -> *mut BlockHeader {
         // 1. clean up free list
 
         let mut first = None;
@@ -50,27 +63,56 @@ impl Bucket {
             // in order to be allocated from, it must become active
             // in order to become active, this function must have been run
             // therefore it is empty. QED.
-            assert_eq!(free_list_ref.allocated(), 0);
-            match first {
-                None => first = Some(free_list),
-                Some(_) => {
-                    top_level.receive(
-                        bucket::bucket_select(free_list_ref._object_size()),
-                        unsafe {
-                            free_list_ref.get_segment().block_header(free_list_ref._segment_idx())
-                        },
-                    );
-                },
-            };
+            assert!(
+                0 == free_list_ref.allocated() || free_list == self.active.load(Ordering::SeqCst)
+            );
+            let is_free = free_list != self.active.load(Ordering::SeqCst);
 
-            free_list = free_list_ref._maybe_next_free();
+            if is_free {
+                free_list_ref.flags.fetch_xor(
+                    block::BLOCK_FLAGS_FREE_LOCK | block::BLOCK_FLAGS_MAYBE_FREE,
+                    Ordering::SeqCst,
+                );
+
+                free_list = free_list_ref._maybe_next_free();
+
+                match first {
+                    None => {
+                        free_list_ref
+                            .flags
+                            .fetch_and(!block::BLOCK_FLAGS_FREE_LOCK, Ordering::SeqCst);
+                        first = Some(free_list_ref)
+                    },
+                    Some(_) => {
+                        free_list_ref.prep_free();
+                        top_level.receive(
+                            bucket::bucket_select(free_list_ref._object_size()),
+                            unsafe {
+                                free_list_ref
+                                    .get_segment()
+                                    .block_header(free_list_ref._segment_idx())
+                            },
+                        );
+                    },
+                };
+            } else {
+                free_list_ref.flags.fetch_and(!block::BLOCK_FLAGS_MAYBE_FREE, Ordering::SeqCst);
+                free_list = free_list_ref._maybe_next_free();
+            }
         }
+        let bh = match first {
+            Some(bh) => bh,
+            None => {
+                let resp = top_level.request(bucket_idx);
+                if let None = resp {
+                    return ptr::null_mut()
+                }
+                unsafe { &mut *resp.unwrap_unchecked().get() }
+            },
+        };
+        bh.prep_active(self as *mut Bucket);
 
-        if let Some(bh) = first {
-            return bh
-        }
-
-        ptr::null_mut()
+        bh as *mut BlockHeader
     }
 }
 
@@ -151,8 +193,9 @@ pub const fn bucket_select(size: usize) -> usize {
 }
 
 const fn semi_logarithmic_interval(lower_boundary: usize, upper_boundary: usize) -> usize {
-    let interval = extrinsic_bsr(upper_boundary) - extrinsic_bsr(lower_boundary);
-    8 + (interval - 3) * 4
+    // let interval = extrinsic_bsr(upper_boundary) - extrinsic_bsr(lower_boundary);
+    // 8 + (interval + 1) * 4
+    bucket_select(upper_boundary) - bucket_select(lower_boundary)
 }
 
 #[cfg(test)]
@@ -195,11 +238,12 @@ const TINY_BUCKET_STEP: usize = 8;
 pub const SMALL_OBJECT_BOUNDARY: usize = 8 * KB;
 pub const LARGE_OBJECT_BOUNDARY: usize = 512 * KB;
 
-const TINY_SMALL_BUCKETS: usize = TINY_OBJECT_BOUNDARY / TINY_BUCKET_STEP - 1;
+pub const TINY_SMALL_BUCKETS: usize = TINY_OBJECT_BOUNDARY / TINY_BUCKET_STEP - 1;
 pub const NONTINY_SMALL_BUCKETS: usize =
     semi_logarithmic_interval(TINY_OBJECT_BOUNDARY, SMALL_OBJECT_BOUNDARY);
 
 pub const SMALL_BUCKETS: usize = TINY_SMALL_BUCKETS + NONTINY_SMALL_BUCKETS;
 pub const LARGE_BUCKETS: usize =
     semi_logarithmic_interval(SMALL_OBJECT_BOUNDARY, LARGE_OBJECT_BOUNDARY);
-pub const BUCKETS: usize = semi_logarithmic_interval(TINY_OBJECT_BOUNDARY, LARGE_OBJECT_BOUNDARY);
+pub const BUCKETS: usize =
+    TINY_SMALL_BUCKETS + semi_logarithmic_interval(TINY_OBJECT_BOUNDARY, LARGE_OBJECT_BOUNDARY);

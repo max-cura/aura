@@ -40,6 +40,7 @@ pub mod constants {
     pub const MB: usize = KB * 1024;
     pub const GB: usize = MB * 1024;
 }
+mod api;
 mod bucket;
 mod free_list;
 mod heap;
@@ -48,15 +49,7 @@ mod segment;
 mod shuffle;
 mod top_level;
 mod util;
-pub mod vm;
-
-// TODO uncomment
-// thread_local! {
-//s static LOCAL_HEAP: Cell<heap::Heap> = Cell::new(Heap::new());
-// }
-
-// /// VERY UNSAFE
-// unsafe fn swap_heap(new_heap: heap::Heap) { LOCAL_HEAP.replace(new_heap); }
+mod vm;
 
 use std::cell::{RefCell, RefMut};
 use std::io::{self, Write};
@@ -64,6 +57,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::{mem, panic, process, thread};
 
+pub use api::{aura_alloc, aura_free, aura_init};
 use rand::prelude::*;
 
 use self::block::BlockHeader;
@@ -77,86 +71,39 @@ enum EncounterCategorization {
     MultiplyEncountered,
 }
 
-fn test_sequential() {
-    top_level::init_top_level();
-    segment::init_registry();
-    // let vm_region = match VMRegion::new(64 * KB, 64 * KB) {
-    //     Ok(r) => r,
-    //     Err(e) => panic!("VMRegion allocation failed: {}", e),
-    // };
-    // let mut block_header = BlockHeader::from_raw_parts(vm_region.base(), 0);
-    let mut seg_blocks = SegmentHeader::new(SegmentType::Small).unwrap();
-    let block_header = unsafe {
-        mem::transmute::<*mut BlockHeader, &mut BlockHeader>(
-            seg_blocks.pop().unwrap_unchecked().get(),
-        )
-    };
-    block_header.format(8 * KB);
-    println!("Finished format");
+fn main() {
+    aura_init();
 
-    let mut objects = Vec::<*mut u8>::new();
-    let iterations = 1_000_000usize;
-    let mut num_allocated = 0usize;
-    let mut num_freed = 0usize;
-    let mut failed_allocations = 0usize;
-
-    for _ in 0..iterations {
-        match thread_rng().gen::<u32>() % 2 {
-            0 => {
-                let obj = block_header.alloc();
-                if !obj.is_null() {
-                    println!("allocated object {:#?}", obj);
-                    objects.push(obj);
-
-                    num_allocated += 1;
-                } else {
-                    failed_allocations += 1;
-                }
-            },
-            1 => {
-                if objects.len() > 0 {
-                    let index = thread_rng().gen_range(0..objects.len());
-                    let selection = objects.remove(index);
-                    println!("freed object {:#?}", selection);
-
-                    block_header.free(selection);
-
-                    num_freed += 1;
-                }
-            },
-            _ => unreachable!(),
-        }
-
-        assert!(objects.iter().all(|item| {
-            match objects.iter().fold(EncounterCategorization::NotEncountered, |accum, item2| {
-                if item == item2 {
-                    match accum {
-                        EncounterCategorization::NotEncountered => {
-                            EncounterCategorization::Encountered
-                        },
-                        EncounterCategorization::Encountered => {
-                            EncounterCategorization::MultiplyEncountered
-                        },
-                        EncounterCategorization::MultiplyEncountered => {
-                            EncounterCategorization::MultiplyEncountered
-                        },
-                    }
-                } else {
-                    accum
-                }
-            }) {
-                EncounterCategorization::Encountered => true,
-                _ => false,
-            }
+    let mut allocs = Vec::new();
+    for _ in 0..36 {
+        let obj = aura_alloc(8 * KB - 1);
+        println!("Allocated object: {:#?}", obj);
+        unsafe { *obj = 3 };
+        allocs.push(obj);
+    }
+    println!("Done allocating first batch");
+    let mut handles = Vec::new();
+    for _ in 0..36 {
+        // need something send
+        let object = unsafe { Box::from_raw(allocs.pop().unwrap()) };
+        handles.push(thread::spawn(move || {
+            aura_free(Box::into_raw(object));
         }));
     }
+    for handle in handles.into_iter() {
+        handle.join().unwrap();
+    }
+    println!("Done freeing");
 
-    assert!(num_allocated >= num_freed);
-    assert!(num_allocated - num_freed <= block_header._count());
-}
+    for i in 0..36 {
+        let obj = aura_alloc(8 * KB - 1);
+        println!("Allocated object: {:#?}", obj);
+        unsafe { *obj = 4 };
+        allocs.push(obj);
+    }
+    println!("Done allocating second batch");
 
-fn main() {
-    test_sequential();
+    println!("toplevel count: {}", top_level::get().count(top_level::TopLevelBlockType::Empty));
 
     // let mut seg_blocks = SegmentHeader::new(SegmentType::Small).unwrap();
     // let block_header = unsafe {

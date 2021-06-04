@@ -2,11 +2,12 @@ use std::cell::UnsafeCell;
 use std::default::Default;
 use std::mem::{self, MaybeUninit};
 use std::ptr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use super::block::BlockHeader;
+use super::block::{self, BlockHeader};
 use super::bucket::*;
 use super::segment::{SegmentHeader, SegmentType};
 
@@ -76,21 +77,25 @@ impl TopLevel {
 
     /// Add a block header to the top-level.
     pub fn receive(&self, index: usize, header: &'static UnsafeCell<BlockHeader>) {
-        let mut guard = if unsafe {
-            mem::transmute::<*mut BlockHeader, &BlockHeader>(header.get()).allocated()
-        } == 0
-        {
-            self.empties.lock()
-        } else {
-            self.indexed(index).lock()
-        };
+        let b_ref = unsafe { mem::transmute::<*mut BlockHeader, &mut BlockHeader>(header.get()) };
+        let mut guard =
+            if b_ref.allocated() == 0 { self.empties.lock() } else { self.indexed(index).lock() };
         guard.push(header);
+        b_ref.flags.fetch_and(!block::BLOCK_FLAGS_FREE_LOCK, Ordering::SeqCst);
     }
 
     /// Request a block from bucket specified by index, otherwise a block sized
     /// appropriately to that bucket, if one can be got, otherwise (finally)
     /// None.
-    pub fn request(&mut self, index: usize) -> Option<&'static UnsafeCell<BlockHeader>> {
+    pub fn request(&self, index: usize) -> Option<&'static UnsafeCell<BlockHeader>> {
+        // Try to find a non-empty but correctly sized block
+        let mut maybe_non_empties = unsafe { self.indexed_unchecked(index).lock() };
+        if !maybe_non_empties.is_empty() {
+            return maybe_non_empties.pop()
+        } else {
+            drop(maybe_non_empties);
+        }
+
         // Try to find an empty block
         let mut maybe_empties = self.empties.lock();
         if !maybe_empties.is_empty() {
@@ -102,19 +107,17 @@ impl TopLevel {
                     &mut *(*b.as_mut().unwrap_unchecked()).get(),
                 )
             };
-            bh.format(bucket_to_size(index));
+            bh.format(bucket_to_size(index + 1));
             return b
-        }
-        // Try to find a non-empty but correctly sized block
-        let mut maybe_non_empties = unsafe { self.indexed_unchecked(index).lock() };
-        if !maybe_non_empties.is_empty() {
-            return maybe_non_empties.pop()
-        } else {
-            drop(maybe_non_empties);
         }
 
         // couldn't find anything, so we allocate new blocks
         let mut first = None;
+        // println!("bucket: {}", index);
+        // println!(
+        //     "TINY_BUCKETS={}, SMALL_BUCKETS={}, LARGE_BUCKETS={}, BUCKETS={}",
+        //     TINY_SMALL_BUCKETS, SMALL_BUCKETS, LARGE_BUCKETS, BUCKETS
+        // );
         for block_header in SegmentHeader::new(SegmentType::from_bucket(index))?.into_iter() {
             match first {
                 None => first = Some(block_header),
@@ -129,7 +132,7 @@ impl TopLevel {
                 &mut *(*first.as_mut().unwrap_unchecked()).get(),
             )
         };
-        bh.format(bucket_to_size(index));
+        bh.format(bucket_to_size(index + 1));
         first
     }
 }

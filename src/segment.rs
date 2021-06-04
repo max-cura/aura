@@ -60,6 +60,11 @@ impl SegmentHeader {
             SegmentType::Small | SegmentType::Large => true,
             _ => false,
         });
+        // match kind {
+        // SegmentType::Small => println!("Creating SMALL segment"),
+        // SegmentType::Large => println!("Creating LARGE segment"),
+        // _ => (),
+        // };
         let vm_region = VMRegion::new(4 * MB, 4 * MB).ok()?;
         unsafe {
             ptr::write(vm_region.base() as *mut SegmentHeader, SegmentHeader {
@@ -79,18 +84,23 @@ impl SegmentHeader {
 
         let num_block_headers = header.num_blocks();
         let block_size = header.block_size();
-        let begin = mem::size_of::<SegmentHeader>()
-            + mem::size_of::<UnsafeCell<BlockHeader>>() * num_block_headers;
-        println!("segment begin offset: {}", begin);
+        // let begin = mem::size_of::<SegmentHeader>()
+        //     + mem::size_of::<UnsafeCell<BlockHeader>>() * num_block_headers;
+        // println!("segment begin offset: {}", begin);
 
         for i in 0..num_block_headers {
             let block_header_ptr = unsafe {
                 mem::transmute::<_, *mut UnsafeCell<BlockHeader>>(header.block_header(i))
             };
-            let block_body_offset = mem::size_of::<SegmentHeader>()
-                + mem::size_of::<UnsafeCell<BlockHeader>>() * num_block_headers
-                + i * block_size;
-            // let block_body_offset = (i + 1) * block_size;
+            // println!("Creating block #{} in segment", i);
+            // let block_body_offset = mem::size_of::<SegmentHeader>()
+            //     + mem::size_of::<UnsafeCell<BlockHeader>>() * num_block_headers
+            //     + i * block_size;
+            let block_body_offset = match kind {
+                SegmentType::Small => (i + 1) * block_size,
+                SegmentType::Large => unimplemented!(),
+                SegmentType::Huge => unimplemented!(),
+            };
             let block_body_ptr = unsafe { vm_region.base().offset(block_body_offset as isize) };
             unsafe {
                 ptr::write(
