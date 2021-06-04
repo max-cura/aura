@@ -7,6 +7,12 @@
 #![feature(const_maybe_uninit_assume_init, inline_const, const_generics, const_evaluatable_checked)]
 #![feature(option_result_unwrap_unchecked)]
 #![feature(format_args_nl)]
+#![feature(test)]
+
+#[macro_use]
+extern crate lazy_static;
+
+extern crate test;
 
 extern crate crossbeam_channel;
 extern crate libc;
@@ -70,6 +76,12 @@ enum EncounterCategorization {
     NotEncountered,
     Encountered,
     MultiplyEncountered,
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn stress_test_masd() {}
 }
 
 fn main() {

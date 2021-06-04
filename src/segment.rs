@@ -47,11 +47,19 @@ struct OpaqueExtendedSegmentHeader {
     block_headers: [UnsafeCell<BlockHeader>],
 }
 
-static mut SEGMENT_REGISTRY: Option<Arc<Mutex<Vec<&'static SegmentHeader>>>> = None;
+lazy_static! {
+    static ref SEGMENT_REGISTRY: Arc<Mutex<Vec<&'static SegmentHeader>>> =
+        Arc::new(Mutex::new(Vec::new()));
+}
 
-pub fn init_registry() { unsafe { SEGMENT_REGISTRY = Some(Arc::new(Mutex::new(Vec::new()))) }; }
+// static mut SEGMENT_REGISTRY: Option<Arc<Mutex<Vec<&'static SegmentHeader>>>>
+// = None;
+
+// pub fn init_registry() { unsafe { SEGMENT_REGISTRY =
+// Some(Arc::new(Mutex::new(Vec::new()))) }; }
 pub fn registry() -> Arc<Mutex<Vec<&'static SegmentHeader>>> {
-    unsafe { SEGMENT_REGISTRY.as_ref().unwrap_unchecked().clone() }
+    // unsafe { SEGMENT_REGISTRY.as_ref().unwrap_unchecked().clone() }
+    SEGMENT_REGISTRY.clone()
 }
 
 impl SegmentHeader {

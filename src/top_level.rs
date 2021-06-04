@@ -26,6 +26,8 @@ pub enum TopLevelBlockType {
 }
 
 unsafe impl Sync for TopLevel {}
+// for lazy_static!
+unsafe impl Send for TopLevel {}
 
 impl TopLevel {
     // New empty toplevel
@@ -159,7 +161,14 @@ impl TopLevel {
     }
 }
 
-static mut TOP_LEVEL: Option<Arc<TopLevel>> = None;
+lazy_static! {
+    static ref TOP_LEVEL: Arc<TopLevel> = Arc::new(TopLevel::new());
+}
+// static mut TOP_LEVEL: Option<Arc<TopLevel>> = None;
 
-pub fn init_top_level() { unsafe { TOP_LEVEL = Some(Arc::new(TopLevel::new())) }; }
-pub fn get() -> Arc<TopLevel> { unsafe { TOP_LEVEL.as_ref().unwrap_unchecked().clone() } }
+// pub fn init_top_level() { unsafe { TOP_LEVEL =
+// Some(Arc::new(TopLevel::new())) }; }
+pub fn get() -> Arc<TopLevel> {
+    // unsafe { TOP_LEVEL.as_ref().unwrap_unchecked().clone() }
+    TOP_LEVEL.clone()
+}

@@ -6,8 +6,8 @@ use super::{heap, top_level};
 use crate::constants::MB;
 
 pub fn aura_init() {
-    top_level::init_top_level();
-    segment::init_registry();
+    // top_level::init_top_level();
+    // segment::init_registry();
 }
 pub fn aura_alloc(size: usize) -> *mut u8 { heap::thread_heap().alloc(size) }
 pub fn aura_free(object: *mut u8) { unsafe { find_block_for_object(object) }.free(object) }
