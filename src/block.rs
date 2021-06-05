@@ -135,7 +135,7 @@ impl BlockHeader {
         //
         // Meshing can take place whenever
         if self.alloc_list.is_empty() {
-            // println!("empty");
+            // eprintln!("empty");
             if !self.free_list.is_empty() {
                 self.alloc_list.swap(self.free_list.swap(ptr::null_mut()));
             } else if !self.pub_free_list.is_empty() {
@@ -146,20 +146,20 @@ impl BlockHeader {
             }
         }
         let prev_cnt = self.alloc_count.fetch_add(1, Ordering::SeqCst);
-        // println!(
-        //     "{}T prev_cnt={}, now={} on {:#?}",
-        //     thread::current().id().as_u64(),
-        //     prev_cnt,
-        //     self.alloc_count.load(Ordering::SeqCst),
-        //     self as *const BlockHeader
-        // );
-        // println!("alloc on {:#?}", self as *const BlockHeader);
+        eprintln!(
+            "{}T prev_cnt={}, now={} on {:#?}",
+            thread::current().id().as_u64(),
+            prev_cnt,
+            self.alloc_count.load(Ordering::SeqCst),
+            self as *const BlockHeader
+        );
+        // eprintln!("alloc on {:#?}", self as *const BlockHeader);
         // update mesh mask
-        // println!("getting addr...");
+        // eprintln!("getting addr...");
         let addr = self.alloc_list.pop();
-        // println!("addr = {:#?}", addr);
+        // eprintln!("addr = {:#?}", addr);
         let raw_offset = unsafe { addr.offset_from(self.slow_interior) };
-        //println!("raw_offset = {}", raw_offset);
+        //eprintln!("raw_offset = {}", raw_offset);
         let offset = raw_offset as usize / self.object_size;
         self.mesh_mask.set(offset);
         // return allocated object
@@ -181,24 +181,24 @@ impl BlockHeader {
         };
         let prev_cnt2 = self.alloc_count.load(Ordering::SeqCst);
         let prev_cnt = self.alloc_count.fetch_sub(1, Ordering::SeqCst);
-        // println!(
-        //     "{}T prev_cnt={} (<- {}), now={} as {:#?}",
-        //     thread::current().id().as_u64(),
-        //     prev_cnt,
-        //     prev_cnt2,
-        //     self.alloc_count.load(Ordering::SeqCst),
-        //     self as *const BlockHeader
-        // );
+        eprintln!(
+            "{}T prev_cnt={} (<- {}), now={} as {:#?}",
+            thread::current().id().as_u64(),
+            prev_cnt,
+            prev_cnt2,
+            self.alloc_count.load(Ordering::SeqCst),
+            self as *const BlockHeader
+        );
 
         if is_pub {
-            // println!("pub free");
+            // eprintln!("pub free");
             self.pub_free_list.push(obj);
         } else {
-            // println!("local free");
+            // eprintln!("local free");
             self.free_list.push(obj);
         }
         if prev_cnt == 1 {
-            // println!(
+            // eprintln!(
             //     "{}T prev_cnt: {} ({:#?})",
             //     thread::current().id().as_u64(),
             //     prev_cnt,
@@ -209,7 +209,7 @@ impl BlockHeader {
                 // if !(self.alloc_count.load(Ordering::SeqCst) == 0
                 //     || BLOCK_FLAGS_IS_ACTIVE == flags_cache & BLOCK_FLAGS_IS_ACTIVE)
                 // {
-                //     println!("{:#?}", self);
+                //     eprintln!("{:#?}", self);
                 //     panic!("assertion violation (that one ,_,)");
                 // }
                 let mut wrote = true;
@@ -324,15 +324,16 @@ impl BlockHeader {
     pub fn format(&mut self, osize: usize) -> *mut u8 {
         // THREAD_RNG.with(|rng| (*rng.borrow_mut()).next_u64());
         let block_size = 1usize << self.get_segment().block_shift();
-        // println!("Block size: {}", block_size);
+        // eprintln!("Block size: {}", block_size);
         // let block_size = 4 * KB;
         self.count = block_size / osize;
-        // println!("block_size={}, osize={}, count={}", block_size, osize, self.count);
+        // eprintln!("block_size={}, osize={}, count={}", block_size, osize,
+        // self.count);
         self.object_size = osize;
 
         let mut order: Vec<usize> = (0..self.count).collect();
         THREAD_RNG.with(|rng| order.shuffle(&mut *rng.borrow_mut()));
-        // println!(
+        // eprintln!(
         //     "Shuffled fmt vec: {}",
         //     order.iter().map(|n| format!("{}", n)).collect::<Vec<_>>().join(", ")
         // );
@@ -353,7 +354,7 @@ impl BlockHeader {
             let tmp1 = unsafe { interior.offset((order[i + 1] * osize) as isize) };
             let tmp2 = tmp1 as *mut *mut u8;
             next = tmp2;
-            // println!(
+            // eprintln!(
             //     "#{}, curr=#{} ({:#?}), next=#{} ({:#?})... ",
             //     i,
             //     order[i],
@@ -401,82 +402,76 @@ mod tests {
         MultiplyEncountered,
     }
 
-    #[test]
-    fn stress_test_sequential() {
-        top_level::init_top_level();
-        segment::init_registry();
-        // let vm_region = match VMRegion::new(64 * KB, 64 * KB) {
-        //     Ok(r) => r,
-        //     Err(e) => panic!("VMRegion allocation failed: {}", e),
-        // };
-        // let mut block_header = BlockHeader::from_raw_parts(vm_region.base(), 0);
-        let mut seg_blocks = SegmentHeader::new(SegmentType::Small).unwrap();
-        let block_header = unsafe {
-            mem::transmute::<*mut BlockHeader, &mut BlockHeader>(
-                seg_blocks.pop().unwrap_unchecked().get(),
-            )
-        };
-        block_header.format(512);
+    //     #[test]
+    //     fn stress_test_sequential() {
+    //         let mut seg_blocks =
+    // SegmentHeader::new(SegmentType::Small).unwrap();         let
+    // block_header = unsafe {             mem::transmute::<*mut
+    // BlockHeader, &mut BlockHeader>(
+    // seg_blocks.pop().unwrap_unchecked().get(),             )
+    //         };
+    //         block_header.format(512);
 
-        let mut objects = Vec::<*mut u8>::new();
-        let iterations = 1_000_000usize;
-        let mut num_allocated = 0usize;
-        let mut num_freed = 0usize;
-        let mut failed_allocations = 0usize;
+    //         let mut objects = Vec::<*mut u8>::new();
+    //         let iterations = 1_000_000usize;
+    //         let mut num_allocated = 0usize;
+    //         let mut num_freed = 0usize;
+    //         let mut failed_allocations = 0usize;
 
-        for _ in 0..iterations {
-            match thread_rng().gen::<u32>() % 2 {
-                0 => {
-                    let obj = block_header.alloc();
-                    if !obj.is_null() {
-                        objects.push(obj);
+    //         for _ in 0..iterations {
+    //             match thread_rng().gen::<u32>() % 2 {
+    //                 0 => {
+    //                     let obj = block_header.alloc();
+    //                     if !obj.is_null() {
+    //                         objects.push(obj);
 
-                        num_allocated += 1;
-                    } else {
-                        failed_allocations += 1;
-                    }
-                },
-                1 => {
-                    if objects.len() > 0 {
-                        let index = thread_rng().gen_range(0..objects.len());
-                        let selection = objects.remove(index);
+    //                         num_allocated += 1;
+    //                     } else {
+    //                         failed_allocations += 1;
+    //                     }
+    //                 },
+    //                 1 => {
+    //                     if objects.len() > 0 {
+    //                         let index =
+    // thread_rng().gen_range(0..objects.len());                         let
+    // selection = objects.remove(index);
 
-                        block_header.free(selection);
+    //                         block_header.free(selection);
 
-                        num_freed += 1;
-                    }
-                },
-                _ => unreachable!(),
-            }
+    //                         num_freed += 1;
+    //                     }
+    //                 },
+    //                 _ => unreachable!(),
+    //             }
 
-            assert!(objects.iter().all(|item| {
-                match objects.iter().fold(
-                    EncounterCategorization::NotEncountered,
-                    |accum, item2| {
-                        if item == item2 {
-                            match accum {
-                                EncounterCategorization::NotEncountered => {
-                                    EncounterCategorization::Encountered
-                                },
-                                EncounterCategorization::Encountered => {
-                                    EncounterCategorization::MultiplyEncountered
-                                },
-                                EncounterCategorization::MultiplyEncountered => {
-                                    EncounterCategorization::MultiplyEncountered
-                                },
-                            }
-                        } else {
-                            accum
-                        }
-                    },
-                ) {
-                    EncounterCategorization::Encountered => true,
-                    _ => false,
-                }
-            }));
-        }
+    //             assert!(objects.iter().all(|item| {
+    //                 match objects.iter().fold(
+    //                     EncounterCategorization::NotEncountered,
+    //                     |accum, item2| {
+    //                         if item == item2 {
+    //                             match accum {
+    //                                 EncounterCategorization::NotEncountered
+    // => {
+    // EncounterCategorization::Encountered
+    // },
+    // EncounterCategorization::Encountered => {
+    // EncounterCategorization::MultiplyEncountered
+    // },
+    // EncounterCategorization::MultiplyEncountered => {
+    // EncounterCategorization::MultiplyEncountered
+    // },                             }
+    //                         } else {
+    //                             accum
+    //                         }
+    //                     },
+    //                 ) {
+    //                     EncounterCategorization::Encountered => true,
+    //                     _ => false,
+    //                 }
+    //             }));
+    //         }
 
-        assert!(num_allocated >= num_freed);
-        assert!(num_allocated - num_freed <= block_header._count());
-    }
+    //         assert!(num_allocated >= num_freed);
+    //         assert!(num_allocated - num_freed <= block_header._count());
+    //     }
 }

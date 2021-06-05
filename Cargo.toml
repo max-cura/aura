@@ -16,9 +16,6 @@ opt-level = 3
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 mach = "0.3"
 
-[dev-dependencies]
-
-
 [dependencies]
 page_size = "0.4"
 libc = "0.2"
@@ -27,5 +24,18 @@ rand = "0.8"
 rand_xoshiro = "0.6"
 nix = "0.20"
 num_cpus = "1.0"
-crossbeam-channel = "0.5"
 lazy_static = "1.4"
+
+
+[dev-dependencies]
+crossbeam-channel = "0.5"
+criterion = "0.3"
+criterion-macro = "0.3"
+
+[[bench]]
+name = "aura_mamd"
+# harness = true
+
+[[bench]]
+name = "libc_mamd"
+# harness = true
